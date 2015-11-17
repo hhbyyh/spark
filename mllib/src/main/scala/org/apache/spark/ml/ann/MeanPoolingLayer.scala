@@ -24,7 +24,8 @@ import org.apache.spark.mllib.linalg.{Vector, Vectors}
  * Layer properties of Mean Pooling transformations
  * @param poolingSize number of inputs
  */
-private[ann] class MeanPoolingLayer(val poolingSize: MapSize, val inputSize: MapSize) extends Layer {
+private[ann] class MeanPoolingLayer(val poolingSize: MapSize,
+    val inputSize: MapSize) extends Layer {
 
   override def getInstance(weights: Vector, position: Int): LayerModel = getInstance(0L)
 

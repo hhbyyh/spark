@@ -172,7 +172,6 @@ private[ann] class ConvolutionalLayerModel private(
    */
   private def getBiasGradient(deltas: Array[BDM[Double]]): Array[Double] = {
     val outMapNum = this.outMapNum
-    
     val gradient = new Array[Double](outMapNum)
     var j: Int = 0
     while (j < outMapNum) {
@@ -288,7 +287,8 @@ private[ann] object ConvolutionalLayerModel {
     val mWidth: Int = matrix.cols
     val kernelHeight: Int = kernel.rows
     val kernelWidth: Int = kernel.cols
-    val extendMatrix = new BDM[Double](mHeight + 2 * (kernelHeight - 1), mWidth + 2 * (kernelWidth - 1))
+    val extendMatrix = new BDM[Double](mHeight + 2 * (kernelHeight - 1),
+      mWidth + 2 * (kernelWidth - 1))
     var i = 0
     var j = 0
     while (i < mHeight) {
@@ -333,3 +333,4 @@ private[ann] object ConvolutionalLayerModel {
     outMatrix
   }
 }
+
