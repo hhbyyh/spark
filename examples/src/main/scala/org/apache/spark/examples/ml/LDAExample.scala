@@ -17,12 +17,15 @@
 
 package org.apache.spark.examples.ml
 
-import org.apache.spark.{SparkContext, SparkConf}
-import org.apache.spark.mllib.linalg.{VectorUDT, Vectors}
+// scalastyle:off println
+import org.apache.spark.{SparkConf, SparkContext}
 // $example on$
 import org.apache.spark.ml.clustering.LDA
-import org.apache.spark.sql.{Row, SQLContext}
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.{DataFrame, SQLContext}
+import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel, RegexTokenizer,
+StopWordsRemover}
+import org.apache.spark.ml.Pipeline
+
 // $example off$
 
 /**
@@ -38,9 +41,7 @@ object LDAExample {
 
   def main(args: Array[String]): Unit = {
     if (args.length != 2) {
-      // scalastyle:off println
       System.err.println("Usage: ml.LDAExample <file> <k>")
-      // scalastyle:on println
       System.exit(1)
     }
     val input = args(0)
@@ -53,10 +54,7 @@ object LDAExample {
 
     // $example on$
     // Loads data
-    val rowRDD = sc.textFile(input).filter(_.nonEmpty)
-      .map(_.split(" ").map(_.toDouble)).map(Vectors.dense).map(Row(_))
-    val schema = StructType(Array(StructField(FEATURES_COL, new VectorUDT, false)))
-    val dataset = sqlContext.createDataFrame(rowRDD, schema)
+    val (dataset, vocab) = preprocess(sc, input)
 
     // Trains a LDA model
     val lda = new LDA()
@@ -70,6 +68,7 @@ object LDAExample {
     val lp = model.logPerplexity(dataset)
 
     // describeTopics
+    println(vocab.mkString(", "))
     val topics = model.describeTopics(3)
 
     // Shows the result
@@ -79,4 +78,35 @@ object LDAExample {
     // $example off$
     sc.stop()
   }
+
+  /**
+   * Load documents, tokenize them, create vocabulary, and prepare documents as term count vectors.
+   * @return (corpus, vocabulary as array)
+   */
+  private def preprocess(
+                          sc: SparkContext,
+                          path: String): (DataFrame, Array[String]) = {
+
+    val sqlContext = SQLContext.getOrCreate(sc)
+    import sqlContext.implicits._
+
+    val df = sc.textFile(path).toDF("docs")
+    val tokenizer = new RegexTokenizer()
+      .setInputCol("docs")
+      .setOutputCol("rawTokens")
+    val stopWordsRemover = new StopWordsRemover()
+      .setInputCol("rawTokens")
+      .setOutputCol("tokens")
+    val countVectorizer = new CountVectorizer()
+      .setInputCol("tokens")
+      .setOutputCol("features")
+    val pipeline = new Pipeline()
+      .setStages(Array(tokenizer, stopWordsRemover, countVectorizer))
+
+    val model = pipeline.fit(df)
+
+    (model.transform(df),
+      model.stages(2).asInstanceOf[CountVectorizerModel].vocabulary)
+  }
 }
+// scalastyle:on println

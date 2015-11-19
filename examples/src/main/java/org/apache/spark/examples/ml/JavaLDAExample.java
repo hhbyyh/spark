@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.spark.examples.ml;
+package ML;
 
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
@@ -30,9 +30,7 @@ import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SQLContext;
 import org.apache.spark.sql.catalyst.expressions.GenericRow;
-import org.apache.spark.sql.types.Metadata;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.types.*;
 
 import java.util.regex.Pattern;
 
@@ -94,4 +92,39 @@ public class JavaLDAExample {
 
     jsc.stop();
   }
+
+  /**
+   * Load documents, tokenize them, create vocabulary, and prepare documents as term count vectors.
+   * @return (corpus, vocabulary as array)
+   */
+  private DataFrame preprocess(JavaSparkContext jsc, String path) {
+
+    SQLContext sqlContext = new SQLContext(jsc);
+
+    JavaRDD<Row> docs = jsc.textFile(path).map(doc => new GenericRow(doc));
+    StructField[] fields = {new StructField("features", new VectorUDT(), false, Metadata.empty())};
+    StructType schema = new StructType(fields);
+    DataFrame dataset = sqlContext.createDataFrame(points, schema);
+
+
+    .toDF("docs")
+    val tokenizer = new RegexTokenizer()
+      .setInputCol("docs")
+      .setOutputCol("rawTokens")
+    val stopWordsRemover = new StopWordsRemover()
+      .setInputCol("rawTokens")
+      .setOutputCol("tokens")
+    val countVectorizer = new CountVectorizer()
+      .setInputCol("tokens")
+      .setOutputCol("features")
+    val pipeline = new Pipeline()
+      .setStages(Array(tokenizer, stopWordsRemover, countVectorizer))
+
+    val model = pipeline.fit(df)
+
+    (model.transform(df),
+      model.stages(2).asInstanceOf[CountVectorizerModel].vocabulary)
+  }
+
+
 }
