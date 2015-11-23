@@ -20,7 +20,7 @@ package org.apache.spark.mllib.optimization
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import breeze.linalg.{DenseVector => BDV}
+import breeze.linalg.{DenseVector => BDV, Vector => BV}
 import breeze.optimize.{CachedDiffFunction, DiffFunction, LBFGS => BreezeLBFGS}
 
 import org.apache.spark.Logging
@@ -172,10 +172,10 @@ object LBFGS extends Logging {
     val costFun =
       new CostFun(data, gradient, updater, regParam, numExamples)
 
-    val lbfgs = new BreezeLBFGS[BDV[Double]](maxNumIterations, numCorrections, convergenceTol)
+    val lbfgs = new BreezeLBFGS[BV[Double]](maxNumIterations, numCorrections, convergenceTol)
 
     val states =
-      lbfgs.iterations(new CachedDiffFunction(costFun), initialWeights.toBreeze.toDenseVector)
+      lbfgs.iterations(new CachedDiffFunction(costFun), initialWeights.toBreeze /*.toDenseVector*/)
 
     /**
      * NOTE: lossSum and loss is computed using the weights from the previous iteration
@@ -206,16 +206,17 @@ object LBFGS extends Logging {
     gradient: Gradient,
     updater: Updater,
     regParam: Double,
-    numExamples: Long) extends DiffFunction[BDV[Double]] {
+    numExamples: Long) extends DiffFunction[BV[Double]] {
 
-    override def calculate(weights: BDV[Double]): (Double, BDV[Double]) = {
+    override def calculate(weights: BV[Double]): (Double, BDV[Double]) = {
       // Have a local copy to avoid the serialization of CostFun object which is not serializable.
       val w = Vectors.fromBreeze(weights)
       val n = w.size
       val bcW = data.context.broadcast(w)
       val localGradient = gradient
 
-      val (gradientSum, lossSum) = data.treeAggregate((Vectors.zeros(n), 0.0))(
+      val initCumGrad = Vectors.sparse(n, Array(), Array())
+      val (gradientSum, lossSum) = data.treeAggregate((initCumGrad, 0.0))(
           seqOp = (c, v) => (c, v) match { case ((grad, loss), (label, features)) =>
             val l = localGradient.compute(
               features, label, bcW.value, grad)
@@ -250,7 +251,7 @@ object LBFGS extends Logging {
        */
       // The following gradientTotal is actually the regularization part of gradient.
       // Will add the gradientSum computed from the data with weights in the next step.
-      val gradientTotal = w.copy
+      val gradientTotal = w.toDense.copy
       axpy(-1.0, updater.compute(w, Vectors.zeros(n), 1, 1, regParam)._1, gradientTotal)
 
       // gradientTotal = gradientSum / numExamples + gradientTotal

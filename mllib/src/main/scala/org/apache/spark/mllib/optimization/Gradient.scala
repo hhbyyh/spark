@@ -18,7 +18,7 @@
 package org.apache.spark.mllib.optimization
 
 import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.mllib.linalg.{DenseVector, Vector, Vectors}
+import org.apache.spark.mllib.linalg.{SparseVector, DenseVector, Vector, Vectors}
 import org.apache.spark.mllib.linalg.BLAS.{axpy, dot, scal}
 import org.apache.spark.mllib.util.MLUtils
 
@@ -185,12 +185,14 @@ class LogisticGradient(numClasses: Int) extends Gradient {
          */
         val weightsArray = weights match {
           case dv: DenseVector => dv.values
+          case sv: SparseVector => sv.toArray
           case _ =>
             throw new IllegalArgumentException(
               s"weights only supports dense vector but got type ${weights.getClass}.")
         }
         val cumGradientArray = cumGradient match {
           case dv: DenseVector => dv.values
+          case sv: SparseVector => sv.toArray
           case _ =>
             throw new IllegalArgumentException(
               s"cumGradient only supports dense vector but got type ${cumGradient.getClass}.")

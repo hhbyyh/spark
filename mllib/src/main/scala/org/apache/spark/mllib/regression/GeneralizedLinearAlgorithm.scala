@@ -219,11 +219,11 @@ abstract class GeneralizedLinearAlgorithm[M <: GeneralizedLinearModel]
      */
     val initialWeights = {
       if (numOfLinearPredictor == 1) {
-        Vectors.zeros(numFeatures)
+        Vectors.sparse(numFeatures, Array(), Array())
       } else if (addIntercept) {
-        Vectors.zeros((numFeatures + 1) * numOfLinearPredictor)
+        Vectors.sparse((numFeatures + 1) * numOfLinearPredictor, Array(), Array())
       } else {
-        Vectors.zeros(numFeatures * numOfLinearPredictor)
+        Vectors.sparse(numFeatures * numOfLinearPredictor, Array(), Array())
       }
     }
     run(input, initialWeights)
