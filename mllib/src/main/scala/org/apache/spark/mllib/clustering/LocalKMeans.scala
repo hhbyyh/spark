@@ -38,14 +38,20 @@ private[mllib] object LocalKMeans extends Logging {
       points: Array[VectorWithNorm],
       weights: Array[Double],
       k: Int,
-      maxIterations: Int
+      maxIterations: Int,
+      sparseMode: Boolean
   ): Array[VectorWithNorm] = {
     val rand = new Random(seed)
     val dimensions = points(0).vector.size
     val centers = new Array[VectorWithNorm](k)
 
     // Initialize centers by sampling using the k-means++ procedure.
-    centers(0) = pickWeighted(rand, points, weights).toDense
+    centers(0) = if (sparseMode) {
+      pickWeighted(rand, points, weights)
+    }
+    else {
+      pickWeighted(rand, points, weights).toDense
+    }
     for (i <- 1 until k) {
       // Pick the next center with a probability proportional to cost under current centers
       val curCenters = centers.view.take(i)
@@ -62,9 +68,19 @@ private[mllib] object LocalKMeans extends Logging {
       if (j == 0) {
         logWarning("kMeansPlusPlus initialization ran out of distinct points for centers." +
           s" Using duplicate point for center k = $i.")
-        centers(i) = points(0).toDense
+        if (sparseMode) {
+          centers(i) = points(0)
+        }
+        else {
+          centers(i) = points(0).toDense
+        }
       } else {
-        centers(i) = points(j - 1).toDense
+        if (sparseMode) {
+          centers(i) = points(j - 1)
+        }
+        else {
+          centers(i) = points(j - 1).toDense
+        }
       }
     }
 
@@ -80,7 +96,15 @@ private[mllib] object LocalKMeans extends Logging {
       while (i < points.length) {
         val p = points(i)
         val index = KMeans.findClosest(centers, p)._1
-        axpy(weights(i), p.vector, sums(index))
+        if (sparseMode) {
+          val brz = p.vector.toBreeze * weights(i) + sums(index).toBreeze
+          val yy = Vectors.fromBreeze(brz)
+          sums(index) = yy
+        }
+        else {
+          axpy(weights(i), p.vector, sums(index))
+        }
+
         counts(index) += weights(i)
         if (index != oldClosest(i)) {
           moved = true
@@ -93,7 +117,12 @@ private[mllib] object LocalKMeans extends Logging {
       while (j < k) {
         if (counts(j) == 0.0) {
           // Assign center to a random point
-          centers(j) = points(rand.nextInt(points.length)).toDense
+          if (sparseMode) {
+            centers(j) = points(rand.nextInt(points.length))
+          }
+          else {
+            centers(j) = points(rand.nextInt(points.length)).toDense
+          }
         } else {
           scal(1.0 / counts(j), sums(j))
           centers(j) = new VectorWithNorm(sums(j))

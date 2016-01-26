@@ -45,14 +45,15 @@ class KMeans private (
     private var initializationMode: String,
     private var initializationSteps: Int,
     private var epsilon: Double,
-    private var seed: Long) extends Serializable with Logging {
+    private var seed: Long,
+    private var sparsePattern: Boolean) extends Serializable with Logging {
 
   /**
    * Constructs a KMeans instance with default parameters: {k: 2, maxIterations: 20, runs: 1,
    * initializationMode: "k-means||", initializationSteps: 5, epsilon: 1e-4, seed: random}.
    */
   @Since("0.8.0")
-  def this() = this(2, 20, 1, KMeans.K_MEANS_PARALLEL, 5, 1e-4, Utils.random.nextLong())
+  def this() = this(2, 20, 1, KMeans.K_MEANS_PARALLEL, 5, 1e-4, Utils.random.nextLong(), true)
 
   /**
    * Number of clusters to create (k).
@@ -266,8 +267,15 @@ class KMeans private (
     while (iteration < maxIterations && !activeRuns.isEmpty) {
       type WeightedPoint = (Vector, Long)
       def mergeContribs(x: WeightedPoint, y: WeightedPoint): WeightedPoint = {
-        axpy(1.0, x._1, y._1)
-        (y._1, x._2 + y._2)
+        if (sparsePattern) {
+          val brz = x._1.toBreeze + y._1.toBreeze
+          val yy = Vectors.fromBreeze(brz)
+          (yy, x._2 + y._2)
+        }
+        else {
+          axpy(1.0, x._1, y._1)
+          (y._1, x._2 + y._2)
+        }
       }
 
       val activeCenters = activeRuns.map(r => centers(r)).toArray
@@ -282,7 +290,12 @@ class KMeans private (
         val k = thisActiveCenters(0).length
         val dims = thisActiveCenters(0)(0).vector.size
 
-        val sums = Array.fill(runs, k)(Vectors.zeros(dims))
+        val sums = if (sparsePattern) {
+          Array.fill(runs, k)(Vectors.sparse(dims, Array(0), Array(0.0)))
+        }
+        else {
+          Array.fill(runs, k)(Vectors.zeros(dims))
+        }
         val counts = Array.fill(runs, k)(0L)
 
         points.foreach { point =>
@@ -290,7 +303,14 @@ class KMeans private (
             val (bestCenter, cost) = KMeans.findClosest(thisActiveCenters(i), point)
             costAccums(i) += cost
             val sum = sums(i)(bestCenter)
-            axpy(1.0, point.vector, sum)
+            if (sparsePattern) {
+              val brz = point.vector.toBreeze + sum.toBreeze
+              val yy = Vectors.fromBreeze(brz)
+              sums(i)(bestCenter) = yy
+            }
+            else {
+              axpy(1.0, point.vector, sum)
+            }
             counts(i)(bestCenter) += 1
           }
         }
@@ -354,7 +374,7 @@ class KMeans private (
     // Sample all the cluster centers in one pass to avoid repeated scans
     val sample = data.takeSample(true, runs * k, new XORShiftRandom(this.seed).nextInt()).toSeq
     Array.tabulate(runs)(r => sample.slice(r * k, (r + 1) * k).map { v =>
-      new VectorWithNorm(Vectors.dense(v.vector.toArray), v.norm)
+      if (sparsePattern) v else new VectorWithNorm(Vectors.dense(v.vector.toArray), v.norm)
     }.toArray)
   }
 
@@ -376,7 +396,13 @@ class KMeans private (
     // Initialize each run's first center to a random point.
     val seed = new XORShiftRandom(this.seed).nextInt()
     val sample = data.takeSample(true, runs, seed).toSeq
-    val newCenters = Array.tabulate(runs)(r => ArrayBuffer(sample(r).toDense))
+    val newCenters = if (sparsePattern){
+      Array.tabulate(runs)(r => ArrayBuffer(sample(r)))
+    }
+    else {
+      Array.tabulate(runs)(r => ArrayBuffer(sample(r).toDense))
+    }
+
 
     /** Merges new centers to centers. */
     def mergeNewCenters(): Unit = {
@@ -436,7 +462,13 @@ class KMeans private (
       }.collect()
       mergeNewCenters()
       chosen.foreach { case (p, rs) =>
-        rs.foreach(newCenters(_) += p.toDense)
+        if (sparsePattern) {
+          rs.foreach(newCenters(_) += p)
+        }
+        else {
+          rs.foreach(newCenters(_) += p.toDense)
+        }
+
       }
       step += 1
     }
@@ -459,7 +491,7 @@ class KMeans private (
     val finalCenters = (0 until runs).par.map { r =>
       val myCenters = centers(r).toArray
       val myWeights = (0 until myCenters.length).map(i => weightMap.getOrElse((r, i), 0.0)).toArray
-      LocalKMeans.kMeansPlusPlus(r, myCenters, myWeights, k, 30)
+      LocalKMeans.kMeansPlusPlus(r, myCenters, myWeights, k, 30, sparsePattern)
     }
 
     finalCenters.toArray
