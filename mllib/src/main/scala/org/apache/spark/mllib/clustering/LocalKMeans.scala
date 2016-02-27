@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.spark.mllib.clustering
 
 import scala.util.Random
@@ -38,20 +37,14 @@ private[mllib] object LocalKMeans extends Logging {
       points: Array[VectorWithNorm],
       weights: Array[Double],
       k: Int,
-      maxIterations: Int,
-      sparseMode: Boolean
+      maxIterations: Int
   ): Array[VectorWithNorm] = {
     val rand = new Random(seed)
     val dimensions = points(0).vector.size
     val centers = new Array[VectorWithNorm](k)
 
     // Initialize centers by sampling using the k-means++ procedure.
-    centers(0) = if (sparseMode) {
-      pickWeighted(rand, points, weights)
-    }
-    else {
-      pickWeighted(rand, points, weights).toDense
-    }
+    centers(0) = pickWeighted(rand, points, weights)
     for (i <- 1 until k) {
       // Pick the next center with a probability proportional to cost under current centers
       val curCenters = centers.view.take(i)
@@ -68,19 +61,9 @@ private[mllib] object LocalKMeans extends Logging {
       if (j == 0) {
         logWarning("kMeansPlusPlus initialization ran out of distinct points for centers." +
           s" Using duplicate point for center k = $i.")
-        if (sparseMode) {
-          centers(i) = points(0)
-        }
-        else {
-          centers(i) = points(0).toDense
-        }
+        centers(i) = points(0)
       } else {
-        if (sparseMode) {
-          centers(i) = points(j - 1)
-        }
-        else {
-          centers(i) = points(j - 1).toDense
-        }
+        centers(i) = points(j - 1)
       }
     }
 
@@ -96,15 +79,8 @@ private[mllib] object LocalKMeans extends Logging {
       while (i < points.length) {
         val p = points(i)
         val index = KMeans.findClosest(centers, p)._1
-        if (sparseMode) {
-          val brz = p.vector.toBreeze * weights(i) + sums(index).toBreeze
-          val yy = Vectors.fromBreeze(brz)
-          sums(index) = yy
-        }
-        else {
-          axpy(weights(i), p.vector, sums(index))
-        }
-
+        val brz = p.vector.toBreeze * weights(i) + sums(index).toBreeze
+        sums(index) = Vectors.fromBreeze(brz)
         counts(index) += weights(i)
         if (index != oldClosest(i)) {
           moved = true
@@ -117,12 +93,7 @@ private[mllib] object LocalKMeans extends Logging {
       while (j < k) {
         if (counts(j) == 0.0) {
           // Assign center to a random point
-          if (sparseMode) {
-            centers(j) = points(rand.nextInt(points.length))
-          }
-          else {
-            centers(j) = points(rand.nextInt(points.length)).toDense
-          }
+          centers(j) = points(rand.nextInt(points.length))
         } else {
           scal(1.0 / counts(j), sums(j))
           centers(j) = new VectorWithNorm(sums(j))

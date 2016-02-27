@@ -21,7 +21,7 @@ import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.Logging
 import org.apache.spark.annotation.Since
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.mllib.linalg.{Vector, Vectors, DenseVector, SparseVector}
 import org.apache.spark.mllib.linalg.BLAS.{axpy, scal}
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
@@ -45,15 +45,14 @@ class KMeans private (
     private var initializationMode: String,
     private var initializationSteps: Int,
     private var epsilon: Double,
-    private var seed: Long,
-    private var sparsePattern: Boolean) extends Serializable with Logging {
+    private var seed: Long) extends Serializable with Logging {
 
   /**
    * Constructs a KMeans instance with default parameters: {k: 2, maxIterations: 20, runs: 1,
    * initializationMode: "k-means||", initializationSteps: 5, epsilon: 1e-4, seed: random}.
    */
   @Since("0.8.0")
-  def this() = this(2, 20, 1, KMeans.K_MEANS_PARALLEL, 5, 1e-4, Utils.random.nextLong(), true)
+  def this() = this(2, 20, 1, KMeans.K_MEANS_PARALLEL, 5, 1e-4, Utils.random.nextLong())
 
   /**
    * Number of clusters to create (k).
@@ -121,6 +120,13 @@ class KMeans private (
   @deprecated("Support for runs is deprecated. This param will have no effect in 2.0.0.", "1.6.0")
   def setRuns(runs: Int): this.type = {
     internalSetRuns(runs)
+  }
+
+  var centerDSthreshold = 1e-4
+
+  def setCenterDSthreshold(threshold: Double): this.type = {
+    this.centerDSthreshold = threshold
+    this
   }
 
   // Internal version of setRuns for Python API, this should be removed at the same time as setRuns
@@ -276,15 +282,8 @@ class KMeans private (
     while (iteration < maxIterations && !activeRuns.isEmpty) {
       type WeightedPoint = (Vector, Long)
       def mergeContribs(x: WeightedPoint, y: WeightedPoint): WeightedPoint = {
-        if (sparsePattern) {
-          val brz = x._1.toBreeze + y._1.toBreeze
-          val yy = Vectors.fromBreeze(brz)
-          (yy, x._2 + y._2)
-        }
-        else {
-          axpy(1.0, x._1, y._1)
-          (y._1, x._2 + y._2)
-        }
+        val sum = KMeans.xpy(x._1, y._1, centerDSthreshold)
+        (sum, x._2 + y._2)
       }
 
       val activeCenters = activeRuns.map(r => centers(r)).toArray
@@ -299,27 +298,14 @@ class KMeans private (
         val k = thisActiveCenters(0).length
         val dims = thisActiveCenters(0)(0).vector.size
 
-        val sums = if (sparsePattern) {
-          Array.fill(runs, k)(Vectors.sparse(dims, Array(0), Array(0.0)))
-        }
-        else {
-          Array.fill(runs, k)(Vectors.zeros(dims))
-        }
+        val sums = Array.fill(runs, k)(Vectors.sparse(dims, Array(0), Array(0.0)))
         val counts = Array.fill(runs, k)(0L)
 
         points.foreach { point =>
           (0 until runs).foreach { i =>
             val (bestCenter, cost) = KMeans.findClosest(thisActiveCenters(i), point)
             costAccums(i) += cost
-            val sum = sums(i)(bestCenter)
-            if (sparsePattern) {
-              val brz = point.vector.toBreeze + sum.toBreeze
-              val yy = Vectors.fromBreeze(brz)
-              sums(i)(bestCenter) = yy
-            }
-            else {
-              axpy(1.0, point.vector, sum)
-            }
+            sums(i)(bestCenter) = KMeans.xpy(sums(i)(bestCenter), point.vector, centerDSthreshold)
             counts(i)(bestCenter) += 1
           }
         }
@@ -382,9 +368,7 @@ class KMeans private (
   : Array[Array[VectorWithNorm]] = {
     // Sample all the cluster centers in one pass to avoid repeated scans
     val sample = data.takeSample(true, runs * k, new XORShiftRandom(this.seed).nextInt()).toSeq
-    Array.tabulate(runs)(r => sample.slice(r * k, (r + 1) * k).map { v =>
-      if (sparsePattern) v else new VectorWithNorm(Vectors.dense(v.vector.toArray), v.norm)
-    }.toArray)
+    Array.tabulate(runs)(r => sample.slice(r * k, (r + 1) * k).toArray)
   }
 
   /**
@@ -405,13 +389,7 @@ class KMeans private (
     // Initialize each run's first center to a random point.
     val seed = new XORShiftRandom(this.seed).nextInt()
     val sample = data.takeSample(true, runs, seed).toSeq
-    val newCenters = if (sparsePattern){
-      Array.tabulate(runs)(r => ArrayBuffer(sample(r)))
-    }
-    else {
-      Array.tabulate(runs)(r => ArrayBuffer(sample(r).toDense))
-    }
-
+    val newCenters = Array.tabulate(runs)(r => ArrayBuffer(sample(r)))
 
     /** Merges new centers to centers. */
     def mergeNewCenters(): Unit = {
@@ -431,10 +409,10 @@ class KMeans private (
       val bcNewCenters = data.context.broadcast(newCenters)
       val preCosts = costs
       costs = data.zip(preCosts).map { case (point, cost) =>
-          Array.tabulate(runs) { r =>
-            math.min(KMeans.pointCost(bcNewCenters.value(r), point), cost(r))
-          }
-        }.persist(StorageLevel.MEMORY_AND_DISK)
+        Array.tabulate(runs) { r =>
+          math.min(KMeans.pointCost(bcNewCenters.value(r), point), cost(r))
+        }
+      }.persist(StorageLevel.MEMORY_AND_DISK)
       val sumCosts = costs
         .aggregate(new Array[Double](runs))(
           seqOp = (s, v) => {
@@ -471,13 +449,7 @@ class KMeans private (
       }.collect()
       mergeNewCenters()
       chosen.foreach { case (p, rs) =>
-        if (sparsePattern) {
-          rs.foreach(newCenters(_) += p)
-        }
-        else {
-          rs.foreach(newCenters(_) += p.toDense)
-        }
-
+        rs.foreach(newCenters(_) += p)
       }
       step += 1
     }
@@ -500,7 +472,7 @@ class KMeans private (
     val finalCenters = (0 until runs).par.map { r =>
       val myCenters = centers(r).toArray
       val myWeights = (0 until myCenters.length).map(i => weightMap.getOrElse((r, i), 0.0)).toArray
-      LocalKMeans.kMeansPlusPlus(r, myCenters, myWeights, k, 30, sparsePattern)
+      LocalKMeans.kMeansPlusPlus(r, myCenters, myWeights, k, 30)
     }
 
     finalCenters.toArray
@@ -646,6 +618,18 @@ object KMeans {
       case KMeans.RANDOM => true
       case KMeans.K_MEANS_PARALLEL => true
       case _ => false
+    }
+  }
+
+  private[clustering] def xpy(x: Vector, y: Vector, centerDSthreshold: Double): Vector = {
+    y match {
+      case d: DenseVector =>
+        axpy(1, x, d)
+        d
+      case s: SparseVector =>
+        val sv = Vectors.fromBreeze(x.toBreeze + s.toBreeze)
+        if(sv.numActives > sv.size * centerDSthreshold) sv.toDense else sv
+      case _ => throw new UnsupportedOperationException("unsupported")
     }
   }
 }
