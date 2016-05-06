@@ -223,7 +223,6 @@ class MatrixFactorizationModel @Since("0.8.0") (
     }
   }
 
-
   /**
    * Recommends top users for all products.
    *
@@ -240,6 +239,21 @@ class MatrixFactorizationModel @Since("0.8.0") (
         (product, ratings)
     }
   }
+
+  /**
+   * Java-friendly version of [[recommendProductsForUsers]].
+   */
+  def javaRecommendProductsForUsers(num: Int): JavaPairRDD[JavaInteger, Array[Rating]] = {
+    JavaPairRDD.fromRDD(recommendProductsForUsers(num).asInstanceOf[RDD[(JavaInteger, Array[Rating])]])
+  }
+
+  /**
+   * Java-friendly version of [[recommendUsersForProducts]].
+   */
+  def javaRecommendUsersForProducts(num: Int): JavaPairRDD[JavaInteger, Array[Rating]] = {
+    JavaPairRDD.fromRDD(recommendUsersForProducts(num).asInstanceOf[RDD[(JavaInteger, Array[Rating])]])
+  }
+
 }
 
 @Since("1.3.0")

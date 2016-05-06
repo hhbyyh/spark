@@ -526,6 +526,19 @@ class Word2VecModel private[spark] (
     findSynonyms(vector, num)
   }
 
+
+  /**
+   * Java-friendly version of [[findSynonyms]].
+   * @param word a word
+   * @param num number of synonyms to find
+   * @return array of (word, cosineSimilarity)
+   */
+  @Since("1.1.0")
+  def JavaFindSynonyms(word: String, num: Int): (Array[String], Array[Double]) = {
+    val synonyms = findSynonyms(word, num)
+    (synonyms.map(_._1), synonyms.map(_._2))
+  }
+
   /**
    * Find synonyms of the vector representation of a word
    * @param vector vector representation of a word
