@@ -18,6 +18,9 @@
 package org.apache.spark.ml.clustering
 
 import org.apache.hadoop.fs.Path
+import org.json4s.DefaultFormats
+import org.json4s.JsonAST.JObject
+import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.annotation.{DeveloperApi, Experimental, Since}
 import org.apache.spark.internal.Logging
@@ -35,6 +38,7 @@ import org.apache.spark.mllib.linalg.{Matrices => OldMatrices, Vector => OldVect
   Vectors => OldVectors}
 import org.apache.spark.mllib.linalg.MatrixImplicits._
 import org.apache.spark.mllib.linalg.VectorImplicits._
+import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions.{col, monotonicallyIncreasingId, udf}
@@ -80,6 +84,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
    *     - Values should be >= 0
    *     - default = uniformly (1.0 / k), following the implementation from
    *       [[https://github.com/Blei-Lab/onlineldavb]].
+   *
    * @group param
    */
   @Since("1.6.0")
@@ -121,6 +126,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
    *     - Value should be >= 0
    *     - default = (1.0 / k), following the implementation from
    *       [[https://github.com/Blei-Lab/onlineldavb]].
+   *
    * @group param
    */
   @Since("1.6.0")
@@ -574,18 +580,30 @@ object LocalLDAModel extends MLReadable[LocalLDAModel] {
       val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
       val dataPath = new Path(path, "data").toString
       val data = sparkSession.read.parquet(dataPath)
-        .select("vocabSize", "topicsMatrix", "docConcentration", "topicConcentration",
-          "gammaShape")
-        .head()
-      val vocabSize = data.getAs[Int](0)
-      val topicsMatrix = data.getAs[Matrix](1)
-      val docConcentration = data.getAs[Vector](2)
-      val topicConcentration = data.getAs[Double](3)
-      val gammaShape = data.getAs[Double](4)
+      val vectorConverted = MLUtils.convertVectorColumnsToML(data, "docConcentration")
+      val Row(vocabSize: Int, topicsMatrix: Matrix, docConcentration: Vector,
+          topicConcentration: Double, gammaShape: Double) =
+        MLUtils.convertMatrixColumnsToML(vectorConverted, "topicsMatrix")
+          .select("vocabSize", "topicsMatrix", "docConcentration",
+            "topicConcentration", "gammaShape").head()
       val oldModel = new OldLocalLDAModel(topicsMatrix, docConcentration, topicConcentration,
         gammaShape)
       val model = new LocalLDAModel(metadata.uid, vocabSize, oldModel, sparkSession)
-      DefaultParamsReader.getAndSetParams(model, metadata)
+
+      implicit val format = DefaultFormats
+      metadata.params match {
+        case JObject(pairs) =>
+          pairs.foreach { case (paramName, jsonValue) =>
+            val variable =
+              if (paramName == "topicDistribution") "topicDistributionCol" else paramName
+            val param = model.getParam(variable)
+            val value = param.jsonDecode(compact(render(jsonValue)))
+            model.set(param, value)
+          }
+        case _ =>
+          throw new IllegalArgumentException(
+            s"Cannot recognize JSON metadata: ${metadata.metadataJson}.")
+      }
       model
     }
   }
