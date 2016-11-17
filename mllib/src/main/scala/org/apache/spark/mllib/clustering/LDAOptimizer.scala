@@ -27,6 +27,7 @@ import org.apache.spark.annotation.{DeveloperApi, Since}
 import org.apache.spark.graphx._
 import org.apache.spark.mllib.impl.PeriodicGraphCheckpointer
 import org.apache.spark.mllib.linalg.{DenseVector, Matrices, SparseVector, Vector, Vectors}
+import org.apache.spark.mllib.linalg.BLAS._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 
@@ -593,7 +594,13 @@ private[clustering] object OnlineLDAOptimizer {
       gammad := (expElogthetad :* (expElogbetad.t * (ctsVector :/ phiNorm))) :+ alpha
       expElogthetad := exp(LDAUtils.dirichletExpectation(gammad))
       // TODO: Keep more values in log space, and only exponentiate when needed.
-      phiNorm := expElogbetad * expElogthetad :+ 1e-100
+      phiNorm := 1e-100
+      gemv(1.0,
+        Matrices.fromBreeze(expElogbetad),
+        Vectors.fromBreeze(expElogthetad),
+        1.0,
+        Vectors.fromBreeze(phiNorm).asInstanceOf[DenseVector])
+//      phiNorm := expElogbetad * expElogthetad :+ 1e-100
       meanGammaChange = sum(abs(gammad - lastgamma)) / k
     }
 
