@@ -586,21 +586,19 @@ private[clustering] object OnlineLDAOptimizer {
     val phiNorm: BDV[Double] = expElogbetad * expElogthetad :+ 1e-100            // ids
     var meanGammaChange = 1D
     val ctsVector = new BDV[Double](cts)                                         // ids
+    val gemvHolder = new BDV[Double](expElogbetad.cols)
 
     // Iterate between gamma and phi until convergence
     while (meanGammaChange > 1e-3) {
       val lastgamma = gammad.copy
-      val temp = new BDV[Double](expElogbetad.cols)
+      gemvHolder := 0D
       gemv(1.0,
         Matrices.fromBreeze(expElogbetad.t),
         Vectors.fromBreeze(ctsVector :/ phiNorm),
         0.0,
-        Vectors.fromBreeze(temp).asInstanceOf[DenseVector]
+        Vectors.fromBreeze(gemvHolder).asInstanceOf[DenseVector]
       )
-      //        K                  K * ids               ids
-      gammad := (expElogthetad :* temp) :+ alpha
-//      //        K                  K * ids               ids
-//      gammad := (expElogthetad :* (expElogbetad.t * (ctsVector :/ phiNorm))) :+ alpha
+      gammad := (expElogthetad :* gemvHolder) :+ alpha
       expElogthetad := exp(LDAUtils.dirichletExpectation(gammad))
       // TODO: Keep more values in log space, and only exponentiate when needed.
       phiNorm := 1e-100
