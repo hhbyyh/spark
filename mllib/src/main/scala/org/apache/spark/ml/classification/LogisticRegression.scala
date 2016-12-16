@@ -1028,8 +1028,6 @@ private[classification] class MultiClassSummarizer extends Serializable {
    * @return This MultilabelSummarizer
    */
   def add(label: Double, weight: Double = 1.0): this.type = {
-    require(weight >= 0.0, s"instance weight, $weight has to be >= 0.0")
-
     if (weight == 0.0) return this
 
     if (label - label.toInt != 0.0 || label < 0) {
@@ -1577,10 +1575,6 @@ private class LogisticAggregator(
    */
   def add(instance: Instance): this.type = {
     instance match { case Instance(label, weight, features) =>
-      require(numFeatures == features.size, s"Dimensions mismatch when adding new instance." +
-        s" Expecting $numFeatures but got ${features.size}.")
-      require(weight >= 0.0, s"instance weight, $weight has to be >= 0.0")
-
       if (weight == 0.0) return this
 
       if (multinomial) {
@@ -1602,9 +1596,6 @@ private class LogisticAggregator(
    * @return This LogisticAggregator object.
    */
   def merge(other: LogisticAggregator): this.type = {
-    require(numFeatures == other.numFeatures, s"Dimensions mismatch when merging with another " +
-      s"LeastSquaresAggregator. Expecting $numFeatures but got ${other.numFeatures}.")
-
     if (other.weightSum != 0.0) {
       weightSum += other.weightSum
       lossSum += other.lossSum
