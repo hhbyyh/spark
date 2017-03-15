@@ -17,117 +17,254 @@
 
 package org.apache.spark.sql.hive
 
-import org.apache.hadoop.hive.conf.HiveConf
-
+import org.apache.spark.SparkContext
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.analysis.Analyzer
+import org.apache.spark.sql.catalyst.analysis.{Analyzer, FunctionRegistry}
 import org.apache.spark.sql.catalyst.parser.ParserInterface
-import org.apache.spark.sql.execution.SparkPlanner
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.execution.{QueryExecution, SparkPlanner, SparkSqlParser}
 import org.apache.spark.sql.execution.datasources._
-import org.apache.spark.sql.hive.client.{HiveClient, HiveClientImpl}
-import org.apache.spark.sql.hive.execution.HiveSqlParser
-import org.apache.spark.sql.internal.{SessionState, SQLConf}
+import org.apache.spark.sql.hive.client.HiveClient
+import org.apache.spark.sql.internal.{SessionState, SharedState, SQLConf}
+import org.apache.spark.sql.streaming.StreamingQueryManager
 
 
 /**
- * A class that holds all session-specific state in a given [[HiveContext]].
+ * A class that holds all session-specific state in a given [[SparkSession]] backed by Hive.
+ * @param sparkContext The [[SparkContext]].
+ * @param sharedState The shared state.
+ * @param conf SQL-specific key-value configurations.
+ * @param experimentalMethods The experimental methods.
+ * @param functionRegistry Internal catalog for managing functions registered by the user.
+ * @param catalog Internal catalog for managing table and database states that uses Hive client for
+ *                interacting with the metastore.
+ * @param sqlParser Parser that extracts expressions, plans, table identifiers etc. from SQL texts.
+ * @param metadataHive The Hive metadata client.
+ * @param analyzer Logical query plan analyzer for resolving unresolved attributes and relations.
+ * @param streamingQueryManager Interface to start and stop
+ *                              [[org.apache.spark.sql.streaming.StreamingQuery]]s.
+ * @param queryExecutionCreator Lambda to create a [[QueryExecution]] from a [[LogicalPlan]]
+ * @param plannerCreator Lambda to create a planner that takes into account Hive-specific strategies
  */
-private[hive] class HiveSessionState(ctx: HiveContext) extends SessionState(ctx) {
-
-  /**
-   * SQLConf and HiveConf contracts:
-   *
-   * 1. create a new o.a.h.hive.ql.session.SessionState for each [[HiveContext]]
-   * 2. when the Hive session is first initialized, params in HiveConf will get picked up by the
-   *    SQLConf.  Additionally, any properties set by set() or a SET command inside sql() will be
-   *    set in the SQLConf *as well as* in the HiveConf.
-   */
-  lazy val hiveconf: HiveConf = {
-    val c = ctx.executionHive.conf
-    ctx.setConf(c.getAllProperties)
-    c
-  }
-
-  /**
-   * A Hive client used for execution.
-   */
-  val executionHive: HiveClientImpl = ctx.hiveSharedState.executionHive.newSession()
-
-  /**
-   * A Hive client used for interacting with the metastore.
-   */
-  val metadataHive: HiveClient = ctx.hiveSharedState.metadataHive.newSession()
-
-  override lazy val conf: SQLConf = new SQLConf {
-    override def caseSensitiveAnalysis: Boolean = getConf(SQLConf.CASE_SENSITIVE, false)
-  }
-
-  /**
-   * Internal catalog for managing table and database states.
-   */
-  override lazy val catalog = {
-    new HiveSessionCatalog(
-      ctx.hiveCatalog,
-      ctx.metadataHive,
-      ctx,
-      ctx.functionResourceLoader,
+private[hive] class HiveSessionState(
+    sparkContext: SparkContext,
+    sharedState: SharedState,
+    conf: SQLConf,
+    experimentalMethods: ExperimentalMethods,
+    functionRegistry: FunctionRegistry,
+    override val catalog: HiveSessionCatalog,
+    sqlParser: ParserInterface,
+    val metadataHive: HiveClient,
+    analyzer: Analyzer,
+    streamingQueryManager: StreamingQueryManager,
+    queryExecutionCreator: LogicalPlan => QueryExecution,
+    val plannerCreator: () => SparkPlanner)
+  extends SessionState(
+      sparkContext,
+      sharedState,
+      conf,
+      experimentalMethods,
       functionRegistry,
-      conf)
-  }
-
-  /**
-   * An analyzer that uses the Hive metastore.
-   */
-  override lazy val analyzer: Analyzer = {
-    new Analyzer(catalog, conf) {
-      override val extendedResolutionRules =
-        catalog.ParquetConversions ::
-        catalog.OrcConversions ::
-        catalog.CreateTables ::
-        catalog.PreInsertionCasts ::
-        PreInsertCastAndRename ::
-        DataSourceAnalysis ::
-        (if (conf.runSQLOnFile) new ResolveDataSource(ctx) :: Nil else Nil)
-
-      override val extendedCheckRules = Seq(PreWriteCheck(conf, catalog))
-    }
-  }
-
-  /**
-   * Parser for HiveQl query texts.
-   */
-  override lazy val sqlParser: ParserInterface = new HiveSqlParser(hiveconf)
+      catalog,
+      sqlParser,
+      analyzer,
+      streamingQueryManager,
+      queryExecutionCreator) { self =>
 
   /**
    * Planner that takes into account Hive-specific strategies.
    */
-  override def planner: SparkPlanner = {
-    new SparkPlanner(ctx.sparkContext, conf, experimentalMethods.extraStrategies)
-      with HiveStrategies {
-      override val hiveContext = ctx
+  override def planner: SparkPlanner = plannerCreator()
 
-      override def strategies: Seq[Strategy] = {
-        experimentalMethods.extraStrategies ++ Seq(
-          FileSourceStrategy,
-          DataSourceStrategy,
-          HiveCommandStrategy(ctx),
-          HiveDDLStrategy,
-          DDLStrategy,
-          SpecialLimits,
-          InMemoryScans,
-          HiveTableScans,
-          DataSinks,
-          Scripts,
-          Aggregation,
-          ExistenceJoin,
-          EquiJoinSelection,
-          BasicOperators,
-          BroadcastNestedLoop,
-          CartesianProduct,
-          DefaultJoin
-        )
-      }
+
+  // ------------------------------------------------------
+  //  Helper methods, partially leftover from pre-2.0 days
+  // ------------------------------------------------------
+
+  override def addJar(path: String): Unit = {
+    metadataHive.addJar(path)
+    super.addJar(path)
+  }
+
+  /**
+   * When true, enables an experimental feature where metastore tables that use the parquet SerDe
+   * are automatically converted to use the Spark SQL parquet table scan, instead of the Hive
+   * SerDe.
+   */
+  def convertMetastoreParquet: Boolean = {
+    conf.getConf(HiveUtils.CONVERT_METASTORE_PARQUET)
+  }
+
+  /**
+   * When true, also tries to merge possibly different but compatible Parquet schemas in different
+   * Parquet data files.
+   *
+   * This configuration is only effective when "spark.sql.hive.convertMetastoreParquet" is true.
+   */
+  def convertMetastoreParquetWithSchemaMerging: Boolean = {
+    conf.getConf(HiveUtils.CONVERT_METASTORE_PARQUET_WITH_SCHEMA_MERGING)
+  }
+
+  /**
+   * When true, enables an experimental feature where metastore tables that use the Orc SerDe
+   * are automatically converted to use the Spark SQL ORC table scan, instead of the Hive
+   * SerDe.
+   */
+  def convertMetastoreOrc: Boolean = {
+    conf.getConf(HiveUtils.CONVERT_METASTORE_ORC)
+  }
+
+  /**
+   * When true, Hive Thrift server will execute SQL queries asynchronously using a thread pool."
+   */
+  def hiveThriftServerAsync: Boolean = {
+    conf.getConf(HiveUtils.HIVE_THRIFT_SERVER_ASYNC)
+  }
+
+  /**
+   * Get an identical copy of the `HiveSessionState`.
+   * This should ideally reuse the `SessionState.clone` but cannot do so.
+   * Doing that will throw an exception when trying to clone the catalog.
+   */
+  override def clone(newSparkSession: SparkSession): HiveSessionState = {
+    val sparkContext = newSparkSession.sparkContext
+    val confCopy = conf.clone()
+    val functionRegistryCopy = functionRegistry.clone()
+    val experimentalMethodsCopy = experimentalMethods.clone()
+    val sqlParser: ParserInterface = new SparkSqlParser(confCopy)
+    val catalogCopy = catalog.newSessionCatalogWith(
+      newSparkSession,
+      confCopy,
+      SessionState.newHadoopConf(sparkContext.hadoopConfiguration, confCopy),
+      functionRegistryCopy,
+      sqlParser)
+    val queryExecutionCreator = (plan: LogicalPlan) => new QueryExecution(newSparkSession, plan)
+
+    val hiveClient =
+      newSparkSession.sharedState.externalCatalog.asInstanceOf[HiveExternalCatalog].client
+        .newSession()
+
+    SessionState.mergeSparkConf(confCopy, sparkContext.getConf)
+
+    new HiveSessionState(
+      sparkContext,
+      newSparkSession.sharedState,
+      confCopy,
+      experimentalMethodsCopy,
+      functionRegistryCopy,
+      catalogCopy,
+      sqlParser,
+      hiveClient,
+      HiveSessionState.createAnalyzer(newSparkSession, catalogCopy, confCopy),
+      new StreamingQueryManager(newSparkSession),
+      queryExecutionCreator,
+      HiveSessionState.createPlannerCreator(
+        newSparkSession,
+        confCopy,
+        experimentalMethodsCopy))
+  }
+
+}
+
+private[hive] object HiveSessionState {
+
+  def apply(sparkSession: SparkSession): HiveSessionState = {
+    apply(sparkSession, new SQLConf)
+  }
+
+  def apply(sparkSession: SparkSession, conf: SQLConf): HiveSessionState = {
+    val initHelper = SessionState(sparkSession, conf)
+
+    val sparkContext = sparkSession.sparkContext
+
+    val catalog = HiveSessionCatalog(
+      sparkSession,
+      initHelper.functionRegistry,
+      initHelper.conf,
+      SessionState.newHadoopConf(sparkContext.hadoopConfiguration, initHelper.conf),
+      initHelper.sqlParser)
+
+    val metadataHive: HiveClient =
+      sparkSession.sharedState.externalCatalog.asInstanceOf[HiveExternalCatalog].client
+        .newSession()
+
+    val analyzer: Analyzer = createAnalyzer(sparkSession, catalog, initHelper.conf)
+
+    val plannerCreator = createPlannerCreator(
+      sparkSession,
+      initHelper.conf,
+      initHelper.experimentalMethods)
+
+    val hiveSessionState = new HiveSessionState(
+      sparkContext,
+      sparkSession.sharedState,
+      initHelper.conf,
+      initHelper.experimentalMethods,
+      initHelper.functionRegistry,
+      catalog,
+      initHelper.sqlParser,
+      metadataHive,
+      analyzer,
+      initHelper.streamingQueryManager,
+      initHelper.queryExecutionCreator,
+      plannerCreator)
+    catalog.functionResourceLoader = hiveSessionState.functionResourceLoader
+    hiveSessionState
+  }
+
+  /**
+   * Create an logical query plan `Analyzer` with rules specific to a `HiveSessionState`.
+   */
+  private def createAnalyzer(
+      sparkSession: SparkSession,
+      catalog: HiveSessionCatalog,
+      sqlConf: SQLConf): Analyzer = {
+    new Analyzer(catalog, sqlConf) {
+      override val extendedResolutionRules: Seq[Rule[LogicalPlan]] =
+        new ResolveHiveSerdeTable(sparkSession) ::
+        new FindDataSourceTable(sparkSession) ::
+        new ResolveSQLOnFile(sparkSession) :: Nil
+
+      override val postHocResolutionRules: Seq[Rule[LogicalPlan]] =
+        new DetermineTableStats(sparkSession) ::
+        catalog.ParquetConversions ::
+        catalog.OrcConversions ::
+        PreprocessTableCreation(sparkSession) ::
+        PreprocessTableInsertion(sqlConf) ::
+        DataSourceAnalysis(sqlConf) ::
+        HiveAnalysis :: Nil
+
+      override val extendedCheckRules = Seq(PreWriteCheck)
     }
   }
 
+  private def createPlannerCreator(
+      associatedSparkSession: SparkSession,
+      sqlConf: SQLConf,
+      experimentalMethods: ExperimentalMethods): () => SparkPlanner = {
+    () =>
+      new SparkPlanner(
+          associatedSparkSession.sparkContext,
+          sqlConf,
+          experimentalMethods.extraStrategies)
+        with HiveStrategies {
+
+        override val sparkSession: SparkSession = associatedSparkSession
+
+        override def strategies: Seq[Strategy] = {
+          experimentalMethods.extraStrategies ++ Seq(
+            FileSourceStrategy,
+            DataSourceStrategy,
+            SpecialLimits,
+            InMemoryScans,
+            HiveTableScans,
+            Scripts,
+            Aggregation,
+            JoinSelection,
+            BasicOperators
+          )
+        }
+      }
+  }
 }

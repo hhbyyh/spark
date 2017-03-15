@@ -17,6 +17,7 @@
 
 import sys
 import warnings
+import json
 
 if sys.version >= '3':
     basestring = str
@@ -27,7 +28,7 @@ from pyspark.context import SparkContext
 from pyspark.rdd import ignore_unicode_prefix
 from pyspark.sql.types import *
 
-__all__ = ["DataFrame", "Column", "DataFrameNaFunctions", "DataFrameStatFunctions"]
+__all__ = ["Column"]
 
 
 def _create_column_from_literal(literal):
@@ -139,8 +140,6 @@ class Column(object):
         df.colName + 1
         1 / df.colName
 
-    .. note:: Experimental
-
     .. versionadded:: 1.3
     """
 
@@ -181,8 +180,9 @@ class Column(object):
     __ror__ = _bin_op("or")
 
     # container operators
-    __contains__ = _bin_op("contains")
-    __getitem__ = _bin_op("apply")
+    def __contains__(self, item):
+        raise ValueError("Cannot apply 'in' operator against a column: please use 'contains' "
+                         "in a string column or 'array_contains' function for an array column.")
 
     # bitwise operators
     bitwiseOR = _bin_op("bitwiseOR")
@@ -238,10 +238,19 @@ class Column(object):
             raise AttributeError(item)
         return self.getField(item)
 
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            if k.step is not None:
+                raise ValueError("slice with step is not supported.")
+            return self.substr(k.start, k.stop)
+        else:
+            return _bin_op("apply")(self, k)
+
     def __iter__(self):
         raise TypeError("Column is not iterable")
 
     # string methods
+    contains = _bin_op("contains")
     rlike = _bin_op("rlike")
     like = _bin_op("like")
     startswith = _bin_op("startsWith")
@@ -268,8 +277,6 @@ class Column(object):
         else:
             raise TypeError("Unexpected type: %s" % type(startPos))
         return Column(jc)
-
-    __getslice__ = substr
 
     @ignore_unicode_prefix
     @since(1.5)
@@ -300,19 +307,38 @@ class Column(object):
     isNotNull = _unary_op("isNotNull", "True if the current expression is not null.")
 
     @since(1.3)
-    def alias(self, *alias):
+    def alias(self, *alias, **kwargs):
         """
         Returns this column aliased with a new name or names (in the case of expressions that
         return more than one column, such as explode).
 
+        :param alias: strings of desired column names (collects all positional arguments passed)
+        :param metadata: a dict of information to be stored in ``metadata`` attribute of the
+            corresponding :class: `StructField` (optional, keyword only argument)
+
+        .. versionchanged:: 2.2
+           Added optional ``metadata`` argument.
+
         >>> df.select(df.age.alias("age2")).collect()
         [Row(age2=2), Row(age2=5)]
+        >>> df.select(df.age.alias("age3", metadata={'max': 99})).schema['age3'].metadata['max']
+        99
         """
 
+        metadata = kwargs.pop('metadata', None)
+        assert not kwargs, 'Unexpected kwargs where passed: %s' % kwargs
+
+        sc = SparkContext._active_spark_context
         if len(alias) == 1:
-            return Column(getattr(self._jc, "as")(alias[0]))
+            if metadata:
+                jmeta = sc._jvm.org.apache.spark.sql.types.Metadata.fromJson(
+                    json.dumps(metadata))
+                return Column(getattr(self._jc, "as")(alias[0], jmeta))
+            else:
+                return Column(getattr(self._jc, "as")(alias[0]))
         else:
-            sc = SparkContext._active_spark_context
+            if metadata:
+                raise ValueError('metadata can only be provided for a single column')
             return Column(getattr(self._jc, "as")(_to_seq(sc, list(alias))))
 
     name = copy_func(alias, sinceversion=2.0, doc=":func:`name` is an alias for :func:`alias`.")
@@ -330,10 +356,9 @@ class Column(object):
         if isinstance(dataType, basestring):
             jc = self._jc.cast(dataType)
         elif isinstance(dataType, DataType):
-            from pyspark.sql import SQLContext
-            sc = SparkContext.getOrCreate()
-            ctx = SQLContext.getOrCreate(sc)
-            jdt = ctx._ssql_ctx.parseDataType(dataType.json())
+            from pyspark.sql import SparkSession
+            spark = SparkSession.builder.getOrCreate()
+            jdt = spark._jsparkSession.parseDataType(dataType.json())
             jc = self._jc.cast(jdt)
         else:
             raise TypeError("unexpected type: %s" % type(dataType))
@@ -418,8 +443,6 @@ class Column(object):
         >>> window = Window.partitionBy("name").orderBy("age").rowsBetween(-1, 1)
         >>> from pyspark.sql.functions import rank, min
         >>> # df.select(rank().over(window), min('age').over(window))
-
-        .. note:: Window functions is only supported with HiveContext in 1.4
         """
         from pyspark.sql.window import WindowSpec
         if not isinstance(window, WindowSpec):
@@ -438,13 +461,15 @@ class Column(object):
 
 def _test():
     import doctest
-    from pyspark.context import SparkContext
-    from pyspark.sql import SQLContext
+    from pyspark.sql import SparkSession
     import pyspark.sql.column
     globs = pyspark.sql.column.__dict__.copy()
-    sc = SparkContext('local[4]', 'PythonTest')
+    spark = SparkSession.builder\
+        .master("local[4]")\
+        .appName("sql.column tests")\
+        .getOrCreate()
+    sc = spark.sparkContext
     globs['sc'] = sc
-    globs['sqlContext'] = SQLContext(sc)
     globs['df'] = sc.parallelize([(2, 'Alice'), (5, 'Bob')]) \
         .toDF(StructType([StructField('age', IntegerType()),
                           StructField('name', StringType())]))
@@ -452,7 +477,7 @@ def _test():
     (failure_count, test_count) = doctest.testmod(
         pyspark.sql.column, globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE | doctest.REPORT_NDIFF)
-    globs['sc'].stop()
+    spark.stop()
     if failure_count:
         exit(-1)
 

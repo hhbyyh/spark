@@ -17,14 +17,14 @@
 
 import sys
 import uuid
-from functools import wraps
+import warnings
 
 if sys.version > '3':
     basestring = str
     unicode = str
 
 from pyspark import SparkContext, since
-from pyspark.mllib.common import inherit_doc
+from pyspark.ml.common import inherit_doc
 
 
 def _jvm():
@@ -37,20 +37,6 @@ def _jvm():
         return jvm
     else:
         raise AttributeError("Cannot load _jvm from SparkContext. Is SparkContext initialized?")
-
-
-def keyword_only(func):
-    """
-    A decorator that forces keyword arguments in the wrapped method
-    and saves actual input keyword arguments in `_input_kwargs`.
-    """
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if len(args) > 1:
-            raise TypeError("Method %s forces keyword arguments." % func.__name__)
-        wrapper._input_kwargs = kwargs
-        return func(*args, **kwargs)
-    return wrapper
 
 
 class Identifiable(object):
@@ -77,8 +63,6 @@ class Identifiable(object):
 @inherit_doc
 class MLWriter(object):
     """
-    .. note:: Experimental
-
     Utility class that can save ML instances.
 
     .. versionadded:: 2.0.0
@@ -93,7 +77,14 @@ class MLWriter(object):
         raise NotImplementedError("MLWriter is not yet implemented for type: %s" % type(self))
 
     def context(self, sqlContext):
-        """Sets the SQL context to use for saving."""
+        """
+        Sets the SQL context to use for saving.
+        .. note:: Deprecated in 2.1 and will be removed in 2.2, use session instead.
+        """
+        raise NotImplementedError("MLWriter is not yet implemented for type: %s" % type(self))
+
+    def session(self, sparkSession):
+        """Sets the Spark Session to use for saving."""
         raise NotImplementedError("MLWriter is not yet implemented for type: %s" % type(self))
 
 
@@ -120,29 +111,35 @@ class JavaMLWriter(MLWriter):
         return self
 
     def context(self, sqlContext):
-        """Sets the SQL context to use for saving."""
+        """
+        Sets the SQL context to use for saving.
+        .. note:: Deprecated in 2.1 and will be removed in 2.2, use session instead.
+        """
+        warnings.warn("Deprecated in 2.1 and will be removed in 2.2, use session instead.")
         self._jwrite.context(sqlContext._ssql_ctx)
+        return self
+
+    def session(self, sparkSession):
+        """Sets the Spark Session to use for saving."""
+        self._jwrite.session(sparkSession._jsparkSession)
         return self
 
 
 @inherit_doc
 class MLWritable(object):
     """
-    .. note:: Experimental
-
     Mixin for ML instances that provide :py:class:`MLWriter`.
 
     .. versionadded:: 2.0.0
     """
 
-    @property
     def write(self):
-        """Returns an JavaMLWriter instance for this ML instance."""
+        """Returns an MLWriter instance for this ML instance."""
         raise NotImplementedError("MLWritable is not yet implemented for type: %r" % type(self))
 
     def save(self, path):
         """Save this ML instance to the given path, a shortcut of `write().save(path)`."""
-        self.write.save(path)
+        self.write().save(path)
 
 
 @inherit_doc
@@ -151,17 +148,14 @@ class JavaMLWritable(MLWritable):
     (Private) Mixin for ML instances that provide :py:class:`JavaMLWriter`.
     """
 
-    @property
     def write(self):
-        """Returns an JavaMLWriter instance for this ML instance."""
+        """Returns an MLWriter instance for this ML instance."""
         return JavaMLWriter(self)
 
 
 @inherit_doc
 class MLReader(object):
     """
-    .. note:: Experimental
-
     Utility class that can load ML instances.
 
     .. versionadded:: 2.0.0
@@ -172,7 +166,14 @@ class MLReader(object):
         raise NotImplementedError("MLReader is not yet implemented for type: %s" % type(self))
 
     def context(self, sqlContext):
-        """Sets the SQL context to use for loading."""
+        """
+        Sets the SQL context to use for loading.
+        .. note:: Deprecated in 2.1 and will be removed in 2.2, use session instead.
+        """
+        raise NotImplementedError("MLReader is not yet implemented for type: %s" % type(self))
+
+    def session(self, sparkSession):
+        """Sets the Spark Session to use for loading."""
         raise NotImplementedError("MLReader is not yet implemented for type: %s" % type(self))
 
 
@@ -197,8 +198,17 @@ class JavaMLReader(MLReader):
         return self._clazz._from_java(java_obj)
 
     def context(self, sqlContext):
-        """Sets the SQL context to use for loading."""
+        """
+        Sets the SQL context to use for loading.
+        .. note:: Deprecated in 2.1 and will be removed in 2.2, use session instead.
+        """
+        warnings.warn("Deprecated in 2.1 and will be removed in 2.2, use session instead.")
         self._jread.context(sqlContext._ssql_ctx)
+        return self
+
+    def session(self, sparkSession):
+        """Sets the Spark Session to use for loading."""
+        self._jread.session(sparkSession._jsparkSession)
         return self
 
     @classmethod
@@ -227,8 +237,6 @@ class JavaMLReader(MLReader):
 @inherit_doc
 class MLReadable(object):
     """
-    .. note:: Experimental
-
     Mixin for instances that provide :py:class:`MLReader`.
 
     .. versionadded:: 2.0.0
@@ -236,7 +244,7 @@ class MLReadable(object):
 
     @classmethod
     def read(cls):
-        """Returns an JavaMLReader instance for this class."""
+        """Returns an MLReader instance for this class."""
         raise NotImplementedError("MLReadable.read() not implemented for type: %r" % cls)
 
     @classmethod
@@ -253,5 +261,21 @@ class JavaMLReadable(MLReadable):
 
     @classmethod
     def read(cls):
-        """Returns an JavaMLReader instance for this class."""
+        """Returns an MLReader instance for this class."""
         return JavaMLReader(cls)
+
+
+@inherit_doc
+class JavaPredictionModel():
+    """
+    (Private) Java Model for prediction tasks (regression and classification).
+    To be mixed in with class:`pyspark.ml.JavaModel`
+    """
+
+    @property
+    @since("2.1.0")
+    def numFeatures(self):
+        """
+        Returns the number of features the model was trained on. If unknown, returns -1
+        """
+        return self._call_java("numFeatures")

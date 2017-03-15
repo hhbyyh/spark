@@ -25,12 +25,11 @@ import scala.language.existentials
 import org.apache.hadoop.fs.Path
 import org.json4s.DefaultFormats
 
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.evaluation.Evaluator
 import org.apache.spark.ml.param.{DoubleParam, ParamMap, ParamValidators}
-import org.apache.spark.ml.param.shared.HasSeed
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.types.StructType
@@ -38,7 +37,7 @@ import org.apache.spark.sql.types.StructType
 /**
  * Params for [[TrainValidationSplit]] and [[TrainValidationSplitModel]].
  */
-private[ml] trait TrainValidationSplitParams extends ValidatorParams with HasSeed {
+private[ml] trait TrainValidationSplitParams extends ValidatorParams {
   /**
    * Param for ratio between train and validation data. Must be between 0 and 1.
    * Default: 0.75
@@ -55,14 +54,12 @@ private[ml] trait TrainValidationSplitParams extends ValidatorParams with HasSee
 }
 
 /**
- * :: Experimental ::
  * Validation for hyper-parameter tuning.
  * Randomly splits the input dataset into train and validation sets,
  * and uses evaluation metric on the validation set to select the best model.
  * Similar to [[CrossValidator]], but only splits the set once.
  */
 @Since("1.5.0")
-@Experimental
 class TrainValidationSplit @Since("1.5.0") (@Since("1.5.0") override val uid: String)
   extends Estimator[TrainValidationSplitModel]
   with TrainValidationSplitParams with MLWritable with Logging {
@@ -94,12 +91,15 @@ class TrainValidationSplit @Since("1.5.0") (@Since("1.5.0") override val uid: St
   override def fit(dataset: Dataset[_]): TrainValidationSplitModel = {
     val schema = dataset.schema
     transformSchema(schema, logging = true)
-    val sqlCtx = dataset.sqlContext
     val est = $(estimator)
     val eval = $(evaluator)
     val epm = $(estimatorParamMaps)
     val numModels = epm.length
     val metrics = new Array[Double](epm.length)
+
+    val instr = Instrumentation.create(this, dataset)
+    instr.logParams(trainRatio, seed)
+    logTuningParams(instr)
 
     val Array(trainingDataset, validationDataset) =
       dataset.randomSplit(Array($(trainRatio), 1 - $(trainRatio)), $(seed))
@@ -127,6 +127,7 @@ class TrainValidationSplit @Since("1.5.0") (@Since("1.5.0") override val uid: St
     logInfo(s"Best set of parameters:\n${epm(bestIndex)}")
     logInfo(s"Best train validation split metric: $bestMetric.")
     val bestModel = est.fit(dataset, epm(bestIndex)).asInstanceOf[Model[_]]
+    instr.logSuccess(bestModel)
     copyValues(new TrainValidationSplitModel(uid, bestModel, metrics).setParent(this))
   }
 
@@ -178,17 +179,18 @@ object TrainValidationSplit extends MLReadable[TrainValidationSplit] {
       val (metadata, estimator, evaluator, estimatorParamMaps) =
         ValidatorParams.loadImpl(path, sc, className)
       val trainRatio = (metadata.params \ "trainRatio").extract[Double]
+      val seed = (metadata.params \ "seed").extract[Long]
       new TrainValidationSplit(metadata.uid)
         .setEstimator(estimator)
         .setEvaluator(evaluator)
         .setEstimatorParamMaps(estimatorParamMaps)
         .setTrainRatio(trainRatio)
+        .setSeed(seed)
     }
   }
 }
 
 /**
- * :: Experimental ::
  * Model from train validation split.
  *
  * @param uid Id.
@@ -196,7 +198,6 @@ object TrainValidationSplit extends MLReadable[TrainValidationSplit] {
  * @param validationMetrics Evaluated validation metrics.
  */
 @Since("1.5.0")
-@Experimental
 class TrainValidationSplitModel private[ml] (
     @Since("1.5.0") override val uid: String,
     @Since("1.5.0") val bestModel: Model[_],
@@ -225,7 +226,7 @@ class TrainValidationSplitModel private[ml] (
       uid,
       bestModel.copy(extra).asInstanceOf[Model[_]],
       validationMetrics.clone())
-    copyValues(copied, extra)
+    copyValues(copied, extra).setParent(parent)
   }
 
   @Since("2.0.0")
@@ -266,14 +267,16 @@ object TrainValidationSplitModel extends MLReadable[TrainValidationSplitModel] {
       val (metadata, estimator, evaluator, estimatorParamMaps) =
         ValidatorParams.loadImpl(path, sc, className)
       val trainRatio = (metadata.params \ "trainRatio").extract[Double]
+      val seed = (metadata.params \ "seed").extract[Long]
       val bestModelPath = new Path(path, "bestModel").toString
       val bestModel = DefaultParamsReader.loadParamsInstance[Model[_]](bestModelPath, sc)
       val validationMetrics = (metadata.metadata \ "validationMetrics").extract[Seq[Double]].toArray
-      val tvs = new TrainValidationSplitModel(metadata.uid, bestModel, validationMetrics)
-      tvs.set(tvs.estimator, estimator)
-        .set(tvs.evaluator, evaluator)
-        .set(tvs.estimatorParamMaps, estimatorParamMaps)
-        .set(tvs.trainRatio, trainRatio)
+      val model = new TrainValidationSplitModel(metadata.uid, bestModel, validationMetrics)
+      model.set(model.estimator, estimator)
+        .set(model.evaluator, evaluator)
+        .set(model.estimatorParamMaps, estimatorParamMaps)
+        .set(model.trainRatio, trainRatio)
+        .set(model.seed, seed)
     }
   }
 }
