@@ -17,18 +17,17 @@
 
 package org.apache.spark.util
 
-import com.google.common.collect.MapMaker
-
 import java.lang.management.ManagementFactory
 import java.lang.reflect.{Field, Modifier}
 import java.util.{IdentityHashMap, Random}
-import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.mutable.ArrayBuffer
 import scala.runtime.ScalaRunTime
 
-import org.apache.spark.Logging
+import com.google.common.collect.MapMaker
+
 import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.internal.Logging
 import org.apache.spark.util.collection.OpenHashSet
 
 /**
@@ -152,13 +151,12 @@ object SizeEstimator extends Logging {
       // TODO: We could use reflection on the VMOption returned ?
       getVMMethod.invoke(bean, "UseCompressedOops").toString.contains("true")
     } catch {
-      case e: Exception => {
+      case e: Exception =>
         // Guess whether they've enabled UseCompressedOops based on whether maxMemory < 32 GB
         val guess = Runtime.getRuntime.maxMemory < (32L*1024*1024*1024)
         val guessInWords = if (guess) "yes" else "not"
         logWarning("Failed to check whether UseCompressedOops is set; assuming " + guessInWords)
         return guess
-      }
     }
   }
 
@@ -209,6 +207,9 @@ object SizeEstimator extends Logging {
     val cls = obj.getClass
     if (cls.isArray) {
       visitArray(obj, cls, state)
+    } else if (cls.getName.startsWith("scala.reflect")) {
+      // Many objects in the scala.reflect package reference global reflection objects which, in
+      // turn, reference many other large global objects. Do nothing in this case.
     } else if (obj.isInstanceOf[ClassLoader] || obj.isInstanceOf[Class[_]]) {
       // Hadoop JobConfs created in the interpreter have a ClassLoader, which greatly confuses
       // the size estimator since it references the whole REPL. Do nothing in this case. In
@@ -254,7 +255,7 @@ object SizeEstimator extends Logging {
       } else {
         // Estimate the size of a large array by sampling elements without replacement.
         // To exclude the shared objects that the array elements may link, sample twice
-        // and use the min one to caculate array size.
+        // and use the min one to calculate array size.
         val rand = new Random(42)
         val drawn = new OpenHashSet[Int](2 * ARRAY_SAMPLE_SIZE)
         val s1 = sampleArray(array, state, rand, drawn, length)
@@ -349,7 +350,7 @@ object SizeEstimator extends Logging {
     // 3. consistent fields layouts throughout the hierarchy: This means we should layout
     // superclass first. And we can use superclass's shellSize as a starting point to layout the
     // other fields in this class.
-    // 4. class alignment: HotSpot rounds field blocks up to to HeapOopSize not 4 bytes, confirmed
+    // 4. class alignment: HotSpot rounds field blocks up to HeapOopSize not 4 bytes, confirmed
     // with Aleksey. see https://bugs.openjdk.java.net/browse/CODETOOLS-7901322
     //
     // The real world field layout is much more complicated. There are three kinds of fields

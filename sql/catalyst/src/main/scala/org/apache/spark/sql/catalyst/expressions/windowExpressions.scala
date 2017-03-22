@@ -18,8 +18,9 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.analysis.UnresolvedException
-import org.apache.spark.sql.catalyst.expressions.aggregate.{NoOp, DeclarativeAggregate}
+import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, UnresolvedException}
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{TypeCheckFailure, TypeCheckSuccess}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{DeclarativeAggregate, NoOp}
 import org.apache.spark.sql.types._
 
 /**
@@ -30,6 +31,7 @@ sealed trait WindowSpec
 
 /**
  * The specification for a window function.
+ *
  * @param partitionSpec It defines the way that input rows are partitioned.
  * @param orderSpec It defines the ordering of rows in a partition.
  * @param frameSpecification It defines the window frame in a partition.
@@ -75,6 +77,22 @@ case class WindowSpecDefinition(
   override def nullable: Boolean = true
   override def foldable: Boolean = false
   override def dataType: DataType = throw new UnsupportedOperationException
+
+  override def sql: String = {
+    val partition = if (partitionSpec.isEmpty) {
+      ""
+    } else {
+      "PARTITION BY " + partitionSpec.map(_.sql).mkString(", ") + " "
+    }
+
+    val order = if (orderSpec.isEmpty) {
+      ""
+    } else {
+      "ORDER BY " + orderSpec.map(_.sql).mkString(", ") + " "
+    }
+
+    s"($partition$order${frameSpecification.toString})"
+  }
 }
 
 /**
@@ -278,6 +296,7 @@ case class WindowExpression(
   override def nullable: Boolean = windowFunction.nullable
 
   override def toString: String = s"$windowFunction $windowSpec"
+  override def sql: String = windowFunction.sql + " OVER " + windowSpec.sql
 }
 
 /**
@@ -302,8 +321,7 @@ abstract class OffsetWindowFunction
   val input: Expression
 
   /**
-   * Default result value for the function when the input expression returns NULL. The default will
-   * evaluated against the current row instead of the offset row.
+   * Default result value for the function when the `offset`th row does not exist.
    */
   val default: Expression
 
@@ -314,8 +332,8 @@ abstract class OffsetWindowFunction
   val offset: Expression
 
   /**
-   * Direction (above = 1/below = -1) of the number of rows between the current row and the row
-   * where the input expression is evaluated.
+   * Direction of the number of rows between the current row and the row where the input expression
+   * is evaluated.
    */
   val direction: SortDirection
 
@@ -327,9 +345,9 @@ abstract class OffsetWindowFunction
    * both the input and the default expression are foldable, the result is still not foldable due to
    * the frame.
    */
-  override def foldable: Boolean = input.foldable && (default == null || default.foldable)
+  override def foldable: Boolean = false
 
-  override def nullable: Boolean = default == null || default.nullable
+  override def nullable: Boolean = default == null || default.nullable || input.nullable
 
   override lazy val frame = {
     // This will be triggered by the Analyzer.
@@ -353,6 +371,24 @@ abstract class OffsetWindowFunction
   override def toString: String = s"$prettyName($input, $offset, $default)"
 }
 
+/**
+ * The Lead function returns the value of `input` at the `offset`th row after the current row in
+ * the window. Offsets start at 0, which is the current row. The offset must be constant
+ * integer value. The default offset is 1. When the value of `input` is null at the `offset`th row,
+ * null is returned. If there is no such offset row, the `default` expression is evaluated.
+ *
+ * @param input expression to evaluate `offset` rows after the current row.
+ * @param offset rows to jump ahead in the partition.
+ * @param default to use when the offset is larger than the window. The default value is null.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_(input[, offset[, default]]) - Returns the value of `input` at the `offset`th row
+      after the current row in the window. The default value of `offset` is 1 and the default
+      value of `default` is null. If the value of `input` at the `offset`th row is null,
+      null is returned. If there is no such an offset row (e.g., when the offset is 1, the last
+      row of the window does not have any subsequent row), `default` is returned.
+  """)
 case class Lead(input: Expression, offset: Expression, default: Expression)
     extends OffsetWindowFunction {
 
@@ -365,6 +401,24 @@ case class Lead(input: Expression, offset: Expression, default: Expression)
   override val direction = Ascending
 }
 
+/**
+ * The Lag function returns the value of `input` at the `offset`th row before the current row in
+ * the window. Offsets start at 0, which is the current row. The offset must be constant
+ * integer value. The default offset is 1. When the value of `input` is null at the `offset`th row,
+ * null is returned. If there is no such offset row, the `default` expression is evaluated.
+ *
+ * @param input expression to evaluate `offset` rows before the current row.
+ * @param offset rows to jump back in the partition.
+ * @param default to use when the offset row does not exist.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_(input[, offset[, default]]) - Returns the value of `input` at the `offset`th row
+      before the current row in the window. The default value of `offset` is 1 and the default
+      value of `default` is null. If the value of `input` at the `offset`th row is null,
+      null is returned. If there is no such offset row (e.g., when the offset is 1, the first
+      row of the window does not have any previous row), `default` is returned.
+  """)
 case class Lag(input: Expression, offset: Expression, default: Expression)
     extends OffsetWindowFunction {
 
@@ -382,14 +436,12 @@ abstract class AggregateWindowFunction extends DeclarativeAggregate with WindowF
   override val frame = SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow)
   override def dataType: DataType = IntegerType
   override def nullable: Boolean = true
-  override def supportsPartial: Boolean = false
   override lazy val mergeExpressions =
     throw new UnsupportedOperationException("Window Functions do not support merging.")
 }
 
 abstract class RowNumberLike extends AggregateWindowFunction {
   override def children: Seq[Expression] = Nil
-  override def inputTypes: Seq[AbstractDataType] = Nil
   protected val zero = Literal(0)
   protected val one = Literal(1)
   protected val rowNumber = AttributeReference("rowNumber", IntegerType, nullable = false)()
@@ -402,34 +454,102 @@ abstract class RowNumberLike extends AggregateWindowFunction {
  * A [[SizeBasedWindowFunction]] needs the size of the current window for its calculation.
  */
 trait SizeBasedWindowFunction extends AggregateWindowFunction {
-  protected def n: AttributeReference = SizeBasedWindowFunction.n
+  // It's made a val so that the attribute created on driver side is serialized to executor side.
+  // Otherwise, if it's defined as a function, when it's called on executor side, it actually
+  // returns the singleton value instantiated on executor side, which has different expression ID
+  // from the one created on driver side.
+  val n: AttributeReference = SizeBasedWindowFunction.n
 }
 
 object SizeBasedWindowFunction {
   val n = AttributeReference("window__partition__size", IntegerType, nullable = false)()
 }
 
+/**
+ * The RowNumber function computes a unique, sequential number to each row, starting with one,
+ * according to the ordering of rows within the window partition.
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_() - Assigns a unique, sequential number to each row, starting with one,
+      according to the ordering of rows within the window partition.
+  """)
 case class RowNumber() extends RowNumberLike {
   override val evaluateExpression = rowNumber
+  override def prettyName: String = "row_number"
 }
 
+/**
+ * The CumeDist function computes the position of a value relative to all values in the partition.
+ * The result is the number of rows preceding or equal to the current row in the ordering of the
+ * partition divided by the total number of rows in the window partition. Any tie values in the
+ * ordering will evaluate to the same position.
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_() - Computes the position of a value relative to all values in the partition.
+  """)
 case class CumeDist() extends RowNumberLike with SizeBasedWindowFunction {
   override def dataType: DataType = DoubleType
   // The frame for CUME_DIST is Range based instead of Row based, because CUME_DIST must
   // return the same value for equal values in the partition.
   override val frame = SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, CurrentRow)
   override val evaluateExpression = Divide(Cast(rowNumber, DoubleType), Cast(n, DoubleType))
+  override def prettyName: String = "cume_dist"
 }
 
+/**
+ * The NTile function divides the rows for each window partition into `n` buckets ranging from 1 to
+ * at most `n`. Bucket values will differ by at most 1. If the number of rows in the partition does
+ * not divide evenly into the number of buckets, then the remainder values are distributed one per
+ * bucket, starting with the first bucket.
+ *
+ * The NTile function is particularly useful for the calculation of tertiles, quartiles, deciles and
+ * other common summary statistics
+ *
+ * The function calculates two variables during initialization: The size of a regular bucket, and
+ * the number of buckets that will have one extra row added to it (when the rows do not evenly fit
+ * into the number of buckets); both variables are based on the size of the current partition.
+ * During the calculation process the function keeps track of the current row number, the current
+ * bucket number, and the row number at which the bucket will change (bucketThreshold). When the
+ * current row number reaches bucket threshold, the bucket value is increased by one and the
+ * threshold is increased by the bucket size (plus one extra if the current bucket is padded).
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
+ *
+ * @param buckets number of buckets to divide the rows in. Default value is 1.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_(n) - Divides the rows for each window partition into `n` buckets ranging
+      from 1 to at most `n`.
+  """)
 case class NTile(buckets: Expression) extends RowNumberLike with SizeBasedWindowFunction {
   def this() = this(Literal(1))
 
+  override def children: Seq[Expression] = Seq(buckets)
+
   // Validate buckets. Note that this could be relaxed, the bucket value only needs to constant
   // for each partition.
-  buckets.eval() match {
-    case b: Int if b > 0 => // Ok
-    case x => throw new AnalysisException(
-      "Buckets expression must be a foldable positive integer expression: $x")
+  override def checkInputDataTypes(): TypeCheckResult = {
+    if (!buckets.foldable) {
+      return TypeCheckFailure(s"Buckets expression must be foldable, but got $buckets")
+    }
+
+    if (buckets.dataType != IntegerType) {
+      return TypeCheckFailure(s"Buckets expression must be integer type, but got $buckets")
+    }
+
+    val i = buckets.eval().asInstanceOf[Int]
+    if (i > 0) {
+      TypeCheckSuccess
+    } else {
+      TypeCheckFailure(s"Buckets expression must be positive, but got: $i")
+    }
   }
 
   private val bucket = AttributeReference("bucket", IntegerType, nullable = false)()
@@ -471,16 +591,17 @@ case class NTile(buckets: Expression) extends RowNumberLike with SizeBasedWindow
 
 /**
  * A RankLike function is a WindowFunction that changes its value based on a change in the value of
- * the order of the window in which is processed. For instance, when the value of 'x' changes in a
- * window ordered by 'x' the rank function also changes. The size of the change of the rank function
- * is (typically) not dependent on the size of the change in 'x'.
+ * the order of the window in which is processed. For instance, when the value of `input` changes
+ * in a window ordered by `input` the rank function also changes. The size of the change of the
+ * rank function is (typically) not dependent on the size of the change in `input`.
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
  */
 abstract class RankLike extends AggregateWindowFunction {
-  override def inputTypes: Seq[AbstractDataType] = children.map(_ => AnyDataType)
 
   /** Store the values of the window 'order' expressions. */
-  protected val orderAttrs = children.map{ expr =>
-    AttributeReference(expr.prettyString, expr.dataType)()
+  protected val orderAttrs = children.map { expr =>
+    AttributeReference(expr.sql, expr.dataType)()
   }
 
   /** Predicate that detects if the order attributes have changed. */
@@ -510,14 +631,50 @@ abstract class RankLike extends AggregateWindowFunction {
   override val updateExpressions = increaseRank +: increaseRowNumber +: children
   override val evaluateExpression: Expression = rank
 
+  override def sql: String = s"${prettyName.toUpperCase}()"
+
   def withOrder(order: Seq[Expression]): RankLike
 }
 
+/**
+ * The Rank function computes the rank of a value in a group of values. The result is one plus the
+ * number of rows preceding or equal to the current row in the ordering of the partition. The values
+ * will produce gaps in the sequence.
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
+ *
+ * @param children to base the rank on; a change in the value of one the children will trigger a
+ *                 change in rank. This is an internal parameter and will be assigned by the
+ *                 Analyser.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_() - Computes the rank of a value in a group of values. The result is one plus the number
+      of rows preceding or equal to the current row in the ordering of the partition. The values
+      will produce gaps in the sequence.
+  """)
 case class Rank(children: Seq[Expression]) extends RankLike {
   def this() = this(Nil)
   override def withOrder(order: Seq[Expression]): Rank = Rank(order)
 }
 
+/**
+ * The DenseRank function computes the rank of a value in a group of values. The result is one plus
+ * the previously assigned rank value. Unlike [[Rank]], [[DenseRank]] will not produce gaps in the
+ * ranking sequence.
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
+ *
+ * @param children to base the rank on; a change in the value of one the children will trigger a
+ *                 change in rank. This is an internal parameter and will be assigned by the
+ *                 Analyser.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_() - Computes the rank of a value in a group of values. The result is one plus the
+      previously assigned rank value. Unlike the function rank, dense_rank will not produce gaps
+      in the ranking sequence.
+  """)
 case class DenseRank(children: Seq[Expression]) extends RankLike {
   def this() = this(Nil)
   override def withOrder(order: Seq[Expression]): DenseRank = DenseRank(order)
@@ -525,8 +682,27 @@ case class DenseRank(children: Seq[Expression]) extends RankLike {
   override val updateExpressions = increaseRank +: children
   override val aggBufferAttributes = rank +: orderAttrs
   override val initialValues = zero +: orderInit
+  override def prettyName: String = "dense_rank"
 }
 
+/**
+ * The PercentRank function computes the percentage ranking of a value in a group of values. The
+ * result the rank of the minus one divided by the total number of rows in the partition minus one:
+ * (r - 1) / (n - 1). If a partition only contains one row, the function will return 0.
+ *
+ * The PercentRank function is similar to the CumeDist function, but it uses rank values instead of
+ * row counts in the its numerator.
+ *
+ * This documentation has been based upon similar documentation for the Hive and Presto projects.
+ *
+ * @param children to base the rank on; a change in the value of one the children will trigger a
+ *                 change in rank. This is an internal parameter and will be assigned by the
+ *                 Analyser.
+ */
+@ExpressionDescription(
+  usage = """
+    _FUNC_() - Computes the percentage ranking of a value in a group of values.
+  """)
 case class PercentRank(children: Seq[Expression]) extends RankLike with SizeBasedWindowFunction {
   def this() = this(Nil)
   override def withOrder(order: Seq[Expression]): PercentRank = PercentRank(order)
@@ -534,4 +710,5 @@ case class PercentRank(children: Seq[Expression]) extends RankLike with SizeBase
   override val evaluateExpression = If(GreaterThan(n, one),
       Divide(Cast(Subtract(rank, one), DoubleType), Cast(Subtract(n, one), DoubleType)),
       Literal(0.0d))
+  override def prettyName: String = "percent_rank"
 }

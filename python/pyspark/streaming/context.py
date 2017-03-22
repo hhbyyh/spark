@@ -94,7 +94,7 @@ class StreamingContext(object):
             # get the GatewayServer object in JVM by ID
             jgws = JavaObject("GATEWAY_SERVER", gw._gateway_client)
             # update the port of CallbackClient with real port
-            gw.jvm.PythonDStream.updatePythonGatewayPort(jgws, gw._python_proxy_port)
+            jgws.resetCallbackClient(jgws.getCallbackClient().getAddress(), gw._python_proxy_port)
 
         # register serializer for TransformFunction
         # it happens before creating SparkContext when loading from checkpointing
@@ -116,16 +116,13 @@ class StreamingContext(object):
         gw = SparkContext._gateway
 
         # Check whether valid checkpoint information exists in the given path
-        if gw.jvm.CheckpointReader.read(checkpointPath).isEmpty():
+        ssc_option = gw.jvm.StreamingContextPythonHelper().tryRecoverFromCheckpoint(checkpointPath)
+        if ssc_option.isEmpty():
             ssc = setupFunc()
             ssc.checkpoint(checkpointPath)
             return ssc
 
-        try:
-            jssc = gw.jvm.JavaStreamingContext(checkpointPath)
-        except Exception:
-            print("failed to load StreamingContext from checkpoint", file=sys.stderr)
-            raise
+        jssc = gw.jvm.JavaStreamingContext(ssc_option.get())
 
         # If there is already an active instance of Python SparkContext use it, or create a new one
         if not SparkContext._active_spark_context:
@@ -307,7 +304,7 @@ class StreamingContext(object):
         Create an input stream from an queue of RDDs or list. In each batch,
         it will process either one or all of the RDDs returned by the queue.
 
-        NOTE: changes to the queue after the stream is created will not be recognized.
+        .. note:: Changes to the queue after the stream is created will not be recognized.
 
         @param rdds:       Queue of RDDs
         @param oneAtATime: pick one rdd each time or pick all of them once.

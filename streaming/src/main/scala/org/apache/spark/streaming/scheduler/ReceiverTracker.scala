@@ -20,14 +20,15 @@ package org.apache.spark.streaming.scheduler
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
 import scala.collection.mutable.HashMap
-import scala.concurrent.{Future, ExecutionContext}
+import scala.concurrent.ExecutionContext
 import scala.language.existentials
 import scala.util.{Failure, Success}
 
 import org.apache.spark._
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.rpc._
-import org.apache.spark.scheduler.{TaskLocation, ExecutorCacheTaskLocation}
+import org.apache.spark.scheduler.{ExecutorCacheTaskLocation, TaskLocation}
 import org.apache.spark.streaming.{StreamingContext, Time}
 import org.apache.spark.streaming.receiver._
 import org.apache.spark.streaming.util.WriteAheadLogUtils
@@ -91,6 +92,8 @@ private[streaming] case object AllReceiverIds extends ReceiverTrackerLocalMessag
 private[streaming] case class UpdateReceiverRateLimit(streamUID: Int, newRate: Long)
   extends ReceiverTrackerLocalMessage
 
+private[streaming] case object GetAllReceiverInfo extends ReceiverTrackerLocalMessage
+
 /**
  * This class manages the execution of the receivers of ReceiverInputDStreams. Instance of
  * this class must be created after all input streams have been added and StreamingContext.start()
@@ -131,7 +134,7 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
 
   // Track the active receiver job number. When a receiver job exits ultimately, countDown will
   // be called.
-  private val receiverJobExitLatch = new CountDownLatch(receiverInputStreams.size)
+  private val receiverJobExitLatch = new CountDownLatch(receiverInputStreams.length)
 
   /**
    * Track all receivers' information. The key is the receiver id, the value is the receiver info.
@@ -167,7 +170,7 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
       trackerState = Stopping
       if (!skipReceiverLaunch) {
         // Send the stop signal to all the receivers
-        endpoint.askWithRetry[Boolean](StopAllReceivers)
+        endpoint.askSync[Boolean](StopAllReceivers)
 
         // Wait for the Spark job that runs the receivers to be over
         // That is, for the receivers to quit gracefully.
@@ -180,7 +183,7 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
         }
 
         // Check if all the receivers have been deregistered or not
-        val receivers = endpoint.askWithRetry[Seq[Int]](AllReceiverIds)
+        val receivers = endpoint.askSync[Seq[Int]](AllReceiverIds)
         if (receivers.nonEmpty) {
           logWarning("Not all of the receivers have deregistered, " + receivers)
         } else {
@@ -191,6 +194,13 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
       // Finally, stop the endpoint
       ssc.env.rpcEnv.stop(endpoint)
       endpoint = null
+      receivedBlockTracker.stop()
+      logInfo("ReceiverTracker stopped")
+      trackerState = Stopped
+    } else if (isTrackerInitialized) {
+      trackerState = Stopping
+      // `ReceivedBlockTracker` is open when this instance is created. We should
+      // close this even if this `ReceiverTracker` is not started.
       receivedBlockTracker.stop()
       logInfo("ReceiverTracker stopped")
       trackerState = Stopped
@@ -231,6 +241,26 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
         }
       }
     }
+  }
+
+  /**
+   * Get the executors allocated to each receiver.
+   * @return a map containing receiver ids to optional executor ids.
+   */
+  def allocatedExecutors(): Map[Int, Option[String]] = synchronized {
+    if (isTrackerStarted) {
+      endpoint.askSync[Map[Int, ReceiverTrackingInfo]](GetAllReceiverInfo).mapValues {
+        _.runningExecutor.map {
+          _.executorId
+        }
+      }
+    } else {
+      Map.empty
+    }
+  }
+
+  def numReceivers(): Int = {
+    receiverInputStreams.size
   }
 
   /** Register a receiver */
@@ -411,17 +441,20 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
    * worker nodes as a parallel collection, and runs them.
    */
   private def launchReceivers(): Unit = {
-    val receivers = receiverInputStreams.map(nis => {
+    val receivers = receiverInputStreams.map { nis =>
       val rcvr = nis.getReceiver()
       rcvr.setReceiverId(nis.id)
       rcvr
-    })
+    }
 
     runDummySparkJob()
 
     logInfo("Starting " + receivers.length + " receivers")
     endpoint.send(StartAllReceivers(receivers))
   }
+
+  /** Check if tracker has been marked for initiated */
+  private def isTrackerInitialized: Boolean = trackerState == Initialized
 
   /** Check if tracker has been marked for starting */
   private def isTrackerStarted: Boolean = trackerState == Started
@@ -434,10 +467,6 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
 
   /** RpcEndpoint to receive messages from the receivers. */
   private class ReceiverTrackerEndpoint(override val rpcEnv: RpcEnv) extends ThreadSafeRpcEndpoint {
-
-    // TODO Remove this thread pool after https://github.com/apache/spark/issues/7385 is merged
-    private val submitJobThreadPool = ExecutionContext.fromExecutorService(
-      ThreadUtils.newDaemonCachedThreadPool("submit-job-thread-pool"))
 
     private val walBatchingThreadPool = ExecutionContext.fromExecutorService(
       ThreadUtils.newDaemonCachedThreadPool("wal-batching-thread-pool"))
@@ -509,9 +538,12 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
       case DeregisterReceiver(streamId, message, error) =>
         deregisterReceiver(streamId, message, error)
         context.reply(true)
+
       // Local messages
       case AllReceiverIds =>
         context.reply(receiverTrackingInfos.filter(_._2.state != ReceiverState.INACTIVE).keys.toSeq)
+      case GetAllReceiverInfo =>
+        context.reply(receiverTrackingInfos.toMap)
       case StopAllReceivers =>
         assert(isTrackerStopping || isTrackerStopped)
         stopReceivers()
@@ -610,12 +642,11 @@ class ReceiverTracker(ssc: StreamingContext, skipReceiverLaunch: Boolean = false
             logInfo(s"Restarting Receiver $receiverId")
             self.send(RestartReceiver(receiver))
           }
-      }(submitJobThreadPool)
+      }(ThreadUtils.sameThread)
       logInfo(s"Receiver ${receiver.streamId} started")
     }
 
     override def onStop(): Unit = {
-      submitJobThreadPool.shutdownNow()
       active = false
       walBatchingThreadPool.shutdown()
     }

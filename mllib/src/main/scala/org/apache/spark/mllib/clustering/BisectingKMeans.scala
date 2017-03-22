@@ -19,11 +19,12 @@ package org.apache.spark.mllib.clustering
 
 import java.util.Random
 
+import scala.annotation.tailrec
 import scala.collection.mutable
 
-import org.apache.spark.Logging
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.JavaRDD
+import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.linalg.{BLAS, Vector, Vectors}
 import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.rdd.RDD
@@ -42,16 +43,16 @@ import org.apache.spark.storage.StorageLevel
  * @param k the desired number of leaf clusters (default: 4). The actual number could be smaller if
  *          there are no divisible leaf clusters.
  * @param maxIterations the max number of k-means iterations to split clusters (default: 20)
- * @param minDivisibleClusterSize the minimum number of points (if >= 1.0) or the minimum proportion
- *                                of points (if < 1.0) of a divisible cluster (default: 1)
+ * @param minDivisibleClusterSize the minimum number of points (if greater than or equal 1.0) or
+ *                                the minimum proportion of points (if less than 1.0) of a divisible
+ *                                cluster (default: 1)
  * @param seed a random seed (default: hash value of the class name)
  *
- * @see [[http://glaros.dtc.umn.edu/gkhome/fetch/papers/docclusterKDDTMW00.pdf
- *     Steinbach, Karypis, and Kumar, A comparison of document clustering techniques,
- *     KDD Workshop on Text Mining, 2000.]]
+ * @see <a href="http://glaros.dtc.umn.edu/gkhome/fetch/papers/docclusterKDDTMW00.pdf">
+ * Steinbach, Karypis, and Kumar, A comparison of document clustering techniques,
+ * KDD Workshop on Text Mining, 2000.</a>
  */
 @Since("1.6.0")
-@Experimental
 class BisectingKMeans private (
     private var k: Int,
     private var maxIterations: Int,
@@ -100,8 +101,8 @@ class BisectingKMeans private (
   def getMaxIterations: Int = this.maxIterations
 
   /**
-   * Sets the minimum number of points (if >= `1.0`) or the minimum proportion of points
-   * (if < `1.0`) of a divisible cluster (default: 1).
+   * Sets the minimum number of points (if greater than or equal to `1.0`) or the minimum proportion
+   * of points (if less than `1.0`) of a divisible cluster (default: 1).
    */
   @Since("1.6.0")
   def setMinDivisibleClusterSize(minDivisibleClusterSize: Double): this.type = {
@@ -112,8 +113,8 @@ class BisectingKMeans private (
   }
 
   /**
-   * Gets the minimum number of points (if >= `1.0`) or the minimum proportion of points
-   * (if < `1.0`) of a divisible cluster.
+   * Gets the minimum number of points (if greater than or equal to `1.0`) or the minimum proportion
+   * of points (if less than `1.0`) of a divisible cluster.
    */
   @Since("1.6.0")
   def getMinDivisibleClusterSize: Double = minDivisibleClusterSize
@@ -165,6 +166,8 @@ class BisectingKMeans private (
     val random = new Random(seed)
     var numLeafClustersNeeded = k - 1
     var level = 1
+    var preIndices: RDD[Long] = null
+    var indices: RDD[Long] = null
     while (activeClusters.nonEmpty && numLeafClustersNeeded > 0 && level < LEVEL_LIMIT) {
       // Divisible clusters are sufficiently large and have non-trivial cost.
       var divisibleClusters = activeClusters.filter { case (_, summary) =>
@@ -194,8 +197,9 @@ class BisectingKMeans private (
           newClusters = summarize(d, newAssignments)
           newClusterCenters = newClusters.mapValues(_.center).map(identity)
         }
-        // TODO: Unpersist old indices.
-        val indices = updateAssignments(assignments, divisibleIndices, newClusterCenters).keys
+        if (preIndices != null) preIndices.unpersist()
+        preIndices = indices
+        indices = updateAssignments(assignments, divisibleIndices, newClusterCenters).keys
           .persist(StorageLevel.MEMORY_AND_DISK)
         assignments = indices.zip(vectors)
         inactiveClusters ++= activeClusters
@@ -208,13 +212,14 @@ class BisectingKMeans private (
       }
       level += 1
     }
+    if(indices != null) indices.unpersist()
     val clusters = activeClusters ++ inactiveClusters
     val root = buildTree(clusters)
     new BisectingKMeansModel(root)
   }
 
   /**
-   * Java-friendly version of [[run()]].
+   * Java-friendly version of `run()`.
    */
   def run(data: JavaRDD[Vector]): BisectingKMeansModel = run(data.rdd)
 }
@@ -334,10 +339,15 @@ private object BisectingKMeans extends Serializable {
     assignments.map { case (index, v) =>
       if (divisibleIndices.contains(index)) {
         val children = Seq(leftChildIndex(index), rightChildIndex(index))
-        val selected = children.minBy { child =>
-          KMeans.fastSquaredDistance(newClusterCenters(child), v)
+        val newClusterChildren = children.filter(newClusterCenters.contains(_))
+        if (newClusterChildren.nonEmpty) {
+          val selected = newClusterChildren.minBy { child =>
+            KMeans.fastSquaredDistance(newClusterCenters(child), v)
+          }
+          (selected, v)
+        } else {
+          (index, v)
         }
-        (selected, v)
       } else {
         (index, v)
       }
@@ -367,12 +377,12 @@ private object BisectingKMeans extends Serializable {
         internalIndex -= 1
         val leftIndex = leftChildIndex(rawIndex)
         val rightIndex = rightChildIndex(rawIndex)
-        val height = math.sqrt(Seq(leftIndex, rightIndex).map { childIndex =>
+        val indexes = Seq(leftIndex, rightIndex).filter(clusters.contains(_))
+        val height = math.sqrt(indexes.map { childIndex =>
           KMeans.fastSquaredDistance(center, clusters(childIndex).center)
         }.max)
-        val left = buildSubTree(leftIndex)
-        val right = buildSubTree(rightIndex)
-        new ClusteringTreeNode(index, size, center, cost, height, Array(left, right))
+        val children = indexes.map(buildSubTree(_)).toArray
+        new ClusteringTreeNode(index, size, center, cost, height, children)
       } else {
         val index = leafIndex
         leafIndex += 1
@@ -406,11 +416,10 @@ private object BisectingKMeans extends Serializable {
  * @param children children nodes
  */
 @Since("1.6.0")
-@Experimental
 private[clustering] class ClusteringTreeNode private[clustering] (
     val index: Int,
     val size: Long,
-    private val centerWithNorm: VectorWithNorm,
+    private[clustering] val centerWithNorm: VectorWithNorm,
     val cost: Double,
     val height: Double,
     val children: Array[ClusteringTreeNode]) extends Serializable {
@@ -467,6 +476,7 @@ private[clustering] class ClusteringTreeNode private[clustering] (
    * @param cost the cost to the current center
    * @return (predicted leaf cluster index, cost)
    */
+  @tailrec
   private def predict(pointWithNorm: VectorWithNorm, cost: Double): (Int, Double) = {
     if (isLeaf) {
       (index, cost)

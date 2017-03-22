@@ -20,8 +20,6 @@ package org.apache.spark.sql.catalyst.expressions.aggregate
 import java.lang.{Long => JLong}
 import java.util
 
-import com.clearspring.analytics.hash.MurmurHash
-
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -48,6 +46,11 @@ import org.apache.spark.sql.types._
  * @param relativeSD the maximum estimation error allowed.
  */
 // scalastyle:on
+@ExpressionDescription(
+  usage = """
+    _FUNC_(expr[, relativeSD]) - Returns the estimated cardinality by HyperLogLog++.
+      `relativeSD` defines the maximum estimation error allowed.
+  """)
 case class HyperLogLogPlusPlus(
     child: Expression,
     relativeSD: Double = 0.05,
@@ -67,6 +70,8 @@ case class HyperLogLogPlusPlus(
       mutableAggBufferOffset = 0,
       inputAggBufferOffset = 0)
   }
+
+  override def prettyName: String = "approx_count_distinct"
 
   override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
     copy(mutableAggBufferOffset = newMutableAggBufferOffset)
@@ -88,7 +93,7 @@ case class HyperLogLogPlusPlus(
   private[this] val p = Math.ceil(2.0d * Math.log(1.106d / relativeSD) / Math.log(2.0d)).toInt
 
   require(p >= 4, "HLL++ requires at least 4 bits for addressing. " +
-    "Use a lower error, at most 27%.")
+    "Use a lower error, at most 39%.")
 
   /**
    * Shift used to extract the index of the register from the hashed value.
@@ -135,8 +140,6 @@ case class HyperLogLogPlusPlus(
 
   override def dataType: DataType = LongType
 
-  override def inputTypes: Seq[AbstractDataType] = Seq(AnyDataType)
-
   override def aggBufferSchema: StructType = StructType.fromAttributes(aggBufferAttributes)
 
   /** Allocate enough words to store all registers. */
@@ -150,7 +153,7 @@ case class HyperLogLogPlusPlus(
     aggBufferAttributes.map(_.newInstance())
 
   /** Fill all words with zeros. */
-  override def initialize(buffer: MutableRow): Unit = {
+  override def initialize(buffer: InternalRow): Unit = {
     var word = 0
     while (word < numWords) {
       buffer.setLong(mutableAggBufferOffset + word, 0)
@@ -163,11 +166,11 @@ case class HyperLogLogPlusPlus(
    *
    * Variable names in the HLL++ paper match variable names in the code.
    */
-  override def update(buffer: MutableRow, input: InternalRow): Unit = {
+  override def update(buffer: InternalRow, input: InternalRow): Unit = {
     val v = child.eval(input)
     if (v != null) {
       // Create the hashed value 'x'.
-      val x = MurmurHash.hash64(v)
+      val x = XxHash64Function.hash(v, child.dataType, 42L)
 
       // Determine the index of the register we are going to use.
       val idx = (x >>> idxShift).toInt
@@ -195,7 +198,7 @@ case class HyperLogLogPlusPlus(
    * Merge the HLL buffers by iterating through the registers in both buffers and select the
    * maximum number of leading zeros for each register.
    */
-  override def merge(buffer1: MutableRow, buffer2: InternalRow): Unit = {
+  override def merge(buffer1: InternalRow, buffer2: InternalRow): Unit = {
     var idx = 0
     var wordOffset = 0
     while (wordOffset < numWords) {
@@ -238,7 +241,7 @@ case class HyperLogLogPlusPlus(
       diff * diff
     }
 
-    // Keep moving bounds as long as the the (exclusive) high bound is closer to the estimate than
+    // Keep moving bounds as long as the (exclusive) high bound is closer to the estimate than
     // the lower (inclusive) bound.
     var low = math.max(nearestEstimateIndex - K + 1, 0)
     var high = math.min(low + K, numEstimates)
@@ -291,8 +294,9 @@ case class HyperLogLogPlusPlus(
     // We integrate two steps from the paper:
     // val Z = 1.0d / zInverse
     // val E = alphaM2 * Z
+    val E = alphaM2 / zInverse
     @inline
-    def EBiasCorrected = alphaM2 / zInverse match {
+    def EBiasCorrected = E match {
       case e if p < 19 && e < 5.0d * m => e - estimateBias(e)
       case e => e
     }
@@ -301,7 +305,9 @@ case class HyperLogLogPlusPlus(
     val estimate = if (V > 0) {
       // Use linear counting for small cardinality estimates.
       val H = m * Math.log(m / V)
-      if (H <= THRESHOLDS(p - 4)) {
+      // HLL++ is defined only when p < 19, otherwise we need to fallback to HLL.
+      // The threshold `2.5 * m` is from the original HLL algorithm.
+      if ((p < 19 && H <= THRESHOLDS(p - 4)) || E <= 2.5 * m) {
         H
       } else {
         EBiasCorrected
@@ -447,6 +453,7 @@ object HyperLogLogPlusPlus {
 
   private def validateDoubleLiteral(exp: Expression): Double = exp match {
     case Literal(d: Double, DoubleType) => d
+    case Literal(dec: Decimal, _) => dec.toDouble
     case _ =>
       throw new AnalysisException("The second argument should be a double literal.")
   }

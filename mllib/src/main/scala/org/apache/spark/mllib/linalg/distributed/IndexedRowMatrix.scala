@@ -20,9 +20,9 @@ package org.apache.spark.mllib.linalg.distributed
 import breeze.linalg.{DenseMatrix => BDM}
 
 import org.apache.spark.annotation.Since
-import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.linalg._
 import org.apache.spark.mllib.linalg.SingularValueDecomposition
+import org.apache.spark.rdd.RDD
 
 /**
  * Represents a row of [[org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix]].
@@ -90,14 +90,16 @@ class IndexedRowMatrix @Since("1.0.0") (
     new RowMatrix(rows.map(_.vector), 0L, nCols)
   }
 
-  /** Converts to BlockMatrix. Creates blocks of [[SparseMatrix]] with size 1024 x 1024. */
+  /**
+   * Converts to BlockMatrix. Creates blocks of `SparseMatrix` with size 1024 x 1024.
+   */
   @Since("1.3.0")
   def toBlockMatrix(): BlockMatrix = {
     toBlockMatrix(1024, 1024)
   }
 
   /**
-   * Converts to BlockMatrix. Creates blocks of [[SparseMatrix]].
+   * Converts to BlockMatrix. Creates blocks of `SparseMatrix`.
    * @param rowsPerBlock The number of rows of each block. The blocks at the bottom edge may have
    *                     a smaller value. Must be an integer value greater than 0.
    * @param colsPerBlock The number of columns of each block. The blocks at the right edge may have
@@ -120,9 +122,9 @@ class IndexedRowMatrix @Since("1.0.0") (
       val rowIndex = row.index
       row.vector match {
         case SparseVector(size, indices, values) =>
-          Iterator.tabulate(indices.size)(i => MatrixEntry(rowIndex, indices(i), values(i)))
+          Iterator.tabulate(indices.length)(i => MatrixEntry(rowIndex, indices(i), values(i)))
         case DenseVector(values) =>
-          Iterator.tabulate(values.size)(i => MatrixEntry(rowIndex, i, values(i)))
+          Iterator.tabulate(values.length)(i => MatrixEntry(rowIndex, i, values(i)))
       }
     }
     new CoordinateMatrix(entries, numRows(), numCols())
@@ -189,6 +191,8 @@ class IndexedRowMatrix @Since("1.0.0") (
 
   /**
    * Computes the Gramian matrix `A^T A`.
+   *
+   * @note This cannot be computed on matrices with more than 65535 columns.
    */
   @Since("1.0.0")
   def computeGramianMatrix(): Matrix = {

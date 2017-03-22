@@ -17,8 +17,10 @@
 
 package org.apache.spark.network.netty
 
+import scala.collection.JavaConverters._
+
 import org.apache.spark.SparkConf
-import org.apache.spark.network.util.{TransportConf, ConfigProvider}
+import org.apache.spark.network.util.{ConfigProvider, TransportConf}
 
 /**
  * Provides a utility for transforming from a SparkConf inside a Spark JVM (e.g., Executor,
@@ -58,6 +60,10 @@ object SparkTransportConf {
 
     new TransportConf(module, new ConfigProvider {
       override def get(name: String): String = conf.get(name)
+
+      override def getAll(): java.lang.Iterable[java.util.Map.Entry[String, String]] = {
+        conf.getAll.toMap.asJava.entrySet()
+      }
     })
   }
 

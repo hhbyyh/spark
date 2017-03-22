@@ -19,9 +19,9 @@ package org.apache.spark.sql.execution.columnar.compression
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.GenericMutableRow
-import org.apache.spark.sql.execution.columnar.ColumnarTestUtils._
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.execution.columnar.{BOOLEAN, NoopColumnStats}
+import org.apache.spark.sql.execution.columnar.ColumnarTestUtils._
 
 class BooleanBitSetSuite extends SparkFunSuite {
   import BooleanBitSet._
@@ -72,7 +72,7 @@ class BooleanBitSetSuite extends SparkFunSuite {
     buffer.rewind().position(headerSize + 4)
 
     val decoder = BooleanBitSet.decoder(buffer, BOOLEAN)
-    val mutableRow = new GenericMutableRow(1)
+    val mutableRow = new GenericInternalRow(1)
     if (values.nonEmpty) {
       values.foreach {
         assert(decoder.hasNext)

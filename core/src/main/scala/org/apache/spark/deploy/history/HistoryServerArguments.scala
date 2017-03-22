@@ -17,11 +17,14 @@
 
 package org.apache.spark.deploy.history
 
-import org.apache.spark.{Logging, SparkConf}
+import scala.annotation.tailrec
+
+import org.apache.spark.SparkConf
+import org.apache.spark.internal.Logging
 import org.apache.spark.util.Utils
 
 /**
- * Command-line parser for the master.
+ * Command-line parser for the [[HistoryServer]].
  */
 private[history] class HistoryServerArguments(conf: SparkConf, args: Array[String])
   extends Logging {
@@ -29,6 +32,7 @@ private[history] class HistoryServerArguments(conf: SparkConf, args: Array[Strin
 
   parse(args.toList)
 
+  @tailrec
   private def parse(args: List[String]): Unit = {
     if (args.length == 1) {
       setLogDirectory(args.head)

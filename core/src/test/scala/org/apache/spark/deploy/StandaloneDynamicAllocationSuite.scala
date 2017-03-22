@@ -20,7 +20,8 @@ package org.apache.spark.deploy
 import scala.collection.mutable
 import scala.concurrent.duration._
 
-import org.mockito.Mockito.{mock, when}
+import org.mockito.Matchers.any
+import org.mockito.Mockito.{mock, verify, when}
 import org.scalatest.{BeforeAndAfterAll, PrivateMethodTester}
 import org.scalatest.concurrent.Eventually._
 
@@ -29,10 +30,11 @@ import org.apache.spark.deploy.DeployMessages.{MasterStateResponse, RequestMaste
 import org.apache.spark.deploy.master.ApplicationInfo
 import org.apache.spark.deploy.master.Master
 import org.apache.spark.deploy.worker.Worker
+import org.apache.spark.internal.config
 import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler.TaskSchedulerImpl
 import org.apache.spark.scheduler.cluster._
-import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RegisterExecutor
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{RegisterExecutor, RegisterExecutorFailed}
 
 /**
  * End-to-end tests for dynamic allocation in standalone mode.
@@ -71,15 +73,18 @@ class StandaloneDynamicAllocationSuite
   }
 
   override def afterAll(): Unit = {
-    masterRpcEnv.shutdown()
-    workerRpcEnvs.foreach(_.shutdown())
-    master.stop()
-    workers.foreach(_.stop())
-    masterRpcEnv = null
-    workerRpcEnvs = null
-    master = null
-    workers = null
-    super.afterAll()
+    try {
+      masterRpcEnv.shutdown()
+      workerRpcEnvs.foreach(_.shutdown())
+      master.stop()
+      workers.foreach(_.stop())
+      masterRpcEnv = null
+      workerRpcEnvs = null
+      master = null
+      workers = null
+    } finally {
+      super.afterAll()
+    }
   }
 
   test("dynamic allocation default behavior") {
@@ -430,21 +435,84 @@ class StandaloneDynamicAllocationSuite
     assert(executors.size === 2)
 
     // simulate running a task on the executor
-    val getMap = PrivateMethod[mutable.HashMap[String, Int]]('executorIdToTaskCount)
+    val getMap =
+      PrivateMethod[mutable.HashMap[String, mutable.HashSet[Long]]]('executorIdToRunningTaskIds)
     val taskScheduler = sc.taskScheduler.asInstanceOf[TaskSchedulerImpl]
-    val executorIdToTaskCount = taskScheduler invokePrivate getMap()
-    executorIdToTaskCount(executors.head) = 1
+    val executorIdToRunningTaskIds = taskScheduler invokePrivate getMap()
+    executorIdToRunningTaskIds(executors.head) = mutable.HashSet(1L)
     // kill the busy executor without force; this should fail
-    assert(!killExecutor(sc, executors.head, force = false))
+    assert(killExecutor(sc, executors.head, force = false).isEmpty)
     apps = getApplications()
     assert(apps.head.executors.size === 2)
 
     // force kill busy executor
-    assert(killExecutor(sc, executors.head, force = true))
+    assert(killExecutor(sc, executors.head, force = true).nonEmpty)
     apps = getApplications()
     // kill executor successfully
     assert(apps.head.executors.size === 1)
+  }
 
+  test("initial executor limit") {
+    val initialExecutorLimit = 1
+    val myConf = appConf
+      .set("spark.dynamicAllocation.enabled", "true")
+      .set("spark.shuffle.service.enabled", "true")
+      .set("spark.dynamicAllocation.initialExecutors", initialExecutorLimit.toString)
+    sc = new SparkContext(myConf)
+    val appId = sc.applicationId
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      val apps = getApplications()
+      assert(apps.size === 1)
+      assert(apps.head.id === appId)
+      assert(apps.head.executors.size === initialExecutorLimit)
+      assert(apps.head.getExecutorLimit === initialExecutorLimit)
+    }
+  }
+
+  test("kill all executors on localhost") {
+    sc = new SparkContext(appConf)
+    val appId = sc.applicationId
+    eventually(timeout(10.seconds), interval(10.millis)) {
+      val apps = getApplications()
+      assert(apps.size === 1)
+      assert(apps.head.id === appId)
+      assert(apps.head.executors.size === 2)
+      assert(apps.head.getExecutorLimit === Int.MaxValue)
+    }
+    val beforeList = getApplications().head.executors.keys.toSet
+    assert(killExecutorsOnHost(sc, "localhost").equals(true))
+
+    syncExecutors(sc)
+    val afterList = getApplications().head.executors.keys.toSet
+
+    eventually(timeout(10.seconds), interval(100.millis)) {
+      assert(beforeList.intersect(afterList).size == 0)
+    }
+  }
+
+  test("executor registration on a blacklisted host must fail") {
+    sc = new SparkContext(appConf.set(config.BLACKLIST_ENABLED.key, "true"))
+    val endpointRef = mock(classOf[RpcEndpointRef])
+    val mockAddress = mock(classOf[RpcAddress])
+    when(endpointRef.address).thenReturn(mockAddress)
+    val message = RegisterExecutor("one", endpointRef, "blacklisted-host", 10, Map.empty)
+
+    // Get "localhost" on a blacklist.
+    val taskScheduler = mock(classOf[TaskSchedulerImpl])
+    when(taskScheduler.nodeBlacklist()).thenReturn(Set("blacklisted-host"))
+    when(taskScheduler.sc).thenReturn(sc)
+    sc.taskScheduler = taskScheduler
+
+    // Create a fresh scheduler backend to blacklist "localhost".
+    sc.schedulerBackend.stop()
+    val backend =
+      new StandaloneSchedulerBackend(taskScheduler, sc, Array(masterRpcEnv.address.toSparkURL))
+    backend.start()
+
+    backend.driverEndpoint.ask[Boolean](message)
+    eventually(timeout(10.seconds), interval(100.millis)) {
+      verify(endpointRef).send(RegisterExecutorFailed(any()))
+    }
   }
 
   // ===============================
@@ -471,7 +539,7 @@ class StandaloneDynamicAllocationSuite
     (0 until numWorkers).map { i =>
       val rpcEnv = workerRpcEnvs(i)
       val worker = new Worker(rpcEnv, 0, cores, memory, Array(masterRpcEnv.address),
-        Worker.SYSTEM_NAME + i, Worker.ENDPOINT_NAME, null, conf, securityManager)
+        Worker.ENDPOINT_NAME, null, conf, securityManager)
       rpcEnv.setupEndpoint(Worker.ENDPOINT_NAME, worker)
       worker
     }
@@ -479,10 +547,10 @@ class StandaloneDynamicAllocationSuite
 
   /** Get the Master state */
   private def getMasterState: MasterStateResponse = {
-    master.self.askWithRetry[MasterStateResponse](RequestMasterState)
+    master.self.askSync[MasterStateResponse](RequestMasterState)
   }
 
-  /** Get the applictions that are active from Master */
+  /** Get the applications that are active from Master */
   private def getApplications(): Seq[ApplicationInfo] = {
     getMasterState.activeApps
   }
@@ -499,11 +567,21 @@ class StandaloneDynamicAllocationSuite
   }
 
   /** Kill the given executor, specifying whether to force kill it. */
-  private def killExecutor(sc: SparkContext, executorId: String, force: Boolean): Boolean = {
+  private def killExecutor(sc: SparkContext, executorId: String, force: Boolean): Seq[String] = {
     syncExecutors(sc)
     sc.schedulerBackend match {
       case b: CoarseGrainedSchedulerBackend =>
         b.killExecutors(Seq(executorId), replace = false, force)
+      case _ => fail("expected coarse grained scheduler")
+    }
+  }
+
+  /** Kill the executors on a given host. */
+  private def killExecutorsOnHost(sc: SparkContext, host: String): Boolean = {
+    syncExecutors(sc)
+    sc.schedulerBackend match {
+      case b: CoarseGrainedSchedulerBackend =>
+        b.killExecutorsOnHost(host)
       case _ => fail("expected coarse grained scheduler")
     }
   }
@@ -537,13 +615,12 @@ class StandaloneDynamicAllocationSuite
     val missingExecutors = masterExecutors.toSet.diff(driverExecutors.toSet).toSeq.sorted
     missingExecutors.foreach { id =>
       // Fake an executor registration so the driver knows about us
-      val port = System.currentTimeMillis % 65536
       val endpointRef = mock(classOf[RpcEndpointRef])
       val mockAddress = mock(classOf[RpcAddress])
       when(endpointRef.address).thenReturn(mockAddress)
-      val message = RegisterExecutor(id, endpointRef, s"localhost:$port", 10, Map.empty)
+      val message = RegisterExecutor(id, endpointRef, "localhost", 10, Map.empty)
       val backend = sc.schedulerBackend.asInstanceOf[CoarseGrainedSchedulerBackend]
-      backend.driverEndpoint.askWithRetry[CoarseGrainedClusterMessage](message)
+      backend.driverEndpoint.askSync[Boolean](message)
     }
   }
 

@@ -18,9 +18,11 @@
 package org.apache.spark.streaming.api.java
 
 import org.apache.spark.streaming.Time
-import org.apache.spark.streaming.scheduler.StreamingListener
 
 private[streaming] trait PythonStreamingListener{
+
+  /** Called when the streaming has been started */
+  def onStreamingStarted(streamingStarted: JavaStreamingListenerStreamingStarted) { }
 
   /** Called when a receiver has been started */
   def onReceiverStarted(receiverStarted: JavaStreamingListenerReceiverStarted) { }
@@ -51,6 +53,11 @@ private[streaming] trait PythonStreamingListener{
 
 private[streaming] class PythonStreamingListenerWrapper(listener: PythonStreamingListener)
   extends JavaStreamingListener {
+
+  /** Called when the streaming has been started */
+  override def onStreamingStarted(streamingStarted: JavaStreamingListenerStreamingStarted): Unit = {
+    listener.onStreamingStarted(streamingStarted)
+  }
 
   /** Called when a receiver has been started */
   override def onReceiverStarted(receiverStarted: JavaStreamingListenerReceiverStarted): Unit = {
@@ -100,6 +107,9 @@ private[streaming] class PythonStreamingListenerWrapper(listener: PythonStreamin
  */
 private[streaming] class JavaStreamingListener {
 
+  /** Called when the streaming has been started */
+  def onStreamingStarted(streamingStarted: JavaStreamingListenerStreamingStarted): Unit = { }
+
   /** Called when a receiver has been started */
   def onReceiverStarted(receiverStarted: JavaStreamingListenerReceiverStarted): Unit = { }
 
@@ -131,6 +141,9 @@ private[streaming] class JavaStreamingListener {
  * Base trait for events related to JavaStreamingListener
  */
 private[streaming] sealed trait JavaStreamingListenerEvent
+
+private[streaming] class JavaStreamingListenerStreamingStarted(val time: Long)
+  extends JavaStreamingListenerEvent
 
 private[streaming] class JavaStreamingListenerBatchSubmitted(val batchInfo: JavaBatchInfo)
   extends JavaStreamingListenerEvent

@@ -23,6 +23,11 @@ import org.apache.spark.streaming.api.java.*;
 public class JavaStreamingListenerAPISuite extends JavaStreamingListener {
 
   @Override
+  public void onStreamingStarted(JavaStreamingListenerStreamingStarted streamingStarted) {
+    super.onStreamingStarted(streamingStarted);
+  }
+
+  @Override
   public void onReceiverStarted(JavaStreamingListenerReceiverStarted receiverStarted) {
     JavaReceiverInfo receiverInfo = receiverStarted.receiverInfo();
     receiverInfo.streamId();
@@ -77,12 +82,14 @@ public class JavaStreamingListenerAPISuite extends JavaStreamingListener {
   }
 
   @Override
-  public void onOutputOperationStarted(JavaStreamingListenerOutputOperationStarted outputOperationStarted) {
+  public void onOutputOperationStarted(
+      JavaStreamingListenerOutputOperationStarted outputOperationStarted) {
     super.onOutputOperationStarted(outputOperationStarted);
   }
 
   @Override
-  public void onOutputOperationCompleted(JavaStreamingListenerOutputOperationCompleted outputOperationCompleted) {
+  public void onOutputOperationCompleted(
+      JavaStreamingListenerOutputOperationCompleted outputOperationCompleted) {
     super.onOutputOperationCompleted(outputOperationCompleted);
   }
 }

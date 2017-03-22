@@ -17,10 +17,9 @@
 
 package org.apache.spark.examples.mllib;
 
-import java.util.ArrayList;
-
 // $example on$
-import com.google.common.collect.Lists;
+import java.util.Arrays;
+import java.util.List;
 // $example off$
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -33,7 +32,7 @@ import org.apache.spark.mllib.linalg.Vectors;
 // $example off$
 
 /**
- * Java example for graph clustering using power iteration clustering (PIC).
+ * Java example for bisecting k-means clustering.
  */
 public class JavaBisectingKMeansExample {
   public static void main(String[] args) {
@@ -41,7 +40,7 @@ public class JavaBisectingKMeansExample {
     JavaSparkContext sc = new JavaSparkContext(sparkConf);
 
     // $example on$
-    ArrayList<Vector> localData = Lists.newArrayList(
+    List<Vector> localData = Arrays.asList(
       Vectors.dense(0.1, 0.1),   Vectors.dense(0.3, 0.3),
       Vectors.dense(10.1, 10.1), Vectors.dense(10.3, 10.3),
       Vectors.dense(20.1, 20.1), Vectors.dense(20.3, 20.3),
@@ -54,9 +53,7 @@ public class JavaBisectingKMeansExample {
     BisectingKMeansModel model = bkm.run(data);
 
     System.out.println("Compute Cost: " + model.computeCost(data));
-    for (Vector center: model.clusterCenters()) {
-      System.out.println("");
-    }
+
     Vector[] clusterCenters = model.clusterCenters();
     for (int i = 0; i < clusterCenters.length; i++) {
       Vector clusterCenter = clusterCenters[i];

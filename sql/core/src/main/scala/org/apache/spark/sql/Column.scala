@@ -19,14 +19,16 @@ package org.apache.spark.sql
 
 import scala.language.implicitConversions
 
-import org.apache.spark.Logging
-import org.apache.spark.annotation.Experimental
-import org.apache.spark.sql.catalyst.SqlParser._
+import org.apache.spark.annotation.InterfaceStability
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.analysis._
-import org.apache.spark.sql.catalyst.encoders.{ExpressionEncoder, encoderFor}
+import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.util.DataTypeParser
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.catalyst.util.usePrettyExpression
 import org.apache.spark.sql.execution.aggregate.TypedAggregateExpression
+import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.types._
 
@@ -37,6 +39,14 @@ private[sql] object Column {
   def apply(expr: Expression): Column = new Column(expr)
 
   def unapply(col: Column): Option[Expression] = Some(col.expr)
+
+  private[sql] def generateAlias(e: Expression): String = {
+    e match {
+      case a: AggregateExpression if a.aggregateFunction.isInstanceOf[TypedAggregateExpression] =>
+        a.aggregateFunction.toString
+      case expr => usePrettyExpression(expr).sql
+    }
+  }
 }
 
 /**
@@ -49,6 +59,7 @@ private[sql] object Column {
  *
  * @since 1.6.0
  */
+@InterfaceStability.Stable
 class TypedColumn[-T, U](
     expr: Expression,
     private[sql] val encoder: ExpressionEncoder[U])
@@ -60,25 +71,39 @@ class TypedColumn[-T, U](
    */
   private[sql] def withInputType(
       inputEncoder: ExpressionEncoder[_],
-      schema: Seq[Attribute]): TypedColumn[T, U] = {
-    val boundEncoder = inputEncoder.bind(schema).asInstanceOf[ExpressionEncoder[Any]]
-    new TypedColumn[T, U](
-      expr transform { case ta: TypedAggregateExpression if ta.aEncoder.isEmpty =>
-        ta.copy(aEncoder = Some(boundEncoder), children = schema)
-      },
-      encoder)
+      inputAttributes: Seq[Attribute]): TypedColumn[T, U] = {
+    val unresolvedDeserializer = UnresolvedDeserializer(inputEncoder.deserializer, inputAttributes)
+    val newExpr = expr transform {
+      case ta: TypedAggregateExpression if ta.inputDeserializer.isEmpty =>
+        ta.withInputInfo(
+          deser = unresolvedDeserializer,
+          cls = inputEncoder.clsTag.runtimeClass,
+          schema = inputEncoder.schema)
+    }
+    new TypedColumn[T, U](newExpr, encoder)
   }
+
+  /**
+   * Gives the TypedColumn a name (alias).
+   * If the current TypedColumn has metadata associated with it, this metadata will be propagated
+   * to the new column.
+   *
+   * @group expr_ops
+   * @since 2.0.0
+   */
+  override def name(alias: String): TypedColumn[T, U] =
+    new TypedColumn[T, U](super.name(alias).expr, encoder)
+
 }
 
 /**
- * :: Experimental ::
- * A column that will be computed based on the data in a [[DataFrame]].
+ * A column that will be computed based on the data in a `DataFrame`.
  *
  * A new column is constructed based on the input columns present in a dataframe:
  *
  * {{{
  *   df("columnName")            // On a specific DataFrame.
- *   col("columnName")           // A generic column no yet associcated with a DataFrame.
+ *   col("columnName")           // A generic column no yet associated with a DataFrame.
  *   col("columnName.field")     // Extracting a struct field
  *   col("`a.column.with.dots`") // Escape `.` in column names.
  *   $"columnName"               // Scala short hand for a named column.
@@ -93,6 +118,9 @@ class TypedColumn[-T, U](
  *   $"a" === $"b"
  * }}}
  *
+ * @note The internal Catalyst expression can be accessed via "expr", but this method is for
+ * debugging purposes only and can change in any future Spark releases.
+ *
  * @groupname java_expr_ops Java-specific expression operators
  * @groupname expr_ops Expression operators
  * @groupname df_ops DataFrame functions
@@ -100,17 +128,25 @@ class TypedColumn[-T, U](
  *
  * @since 1.3.0
  */
-@Experimental
-class Column(protected[sql] val expr: Expression) extends Logging {
+@InterfaceStability.Stable
+class Column(val expr: Expression) extends Logging {
 
   def this(name: String) = this(name match {
     case "*" => UnresolvedStar(None)
-    case _ if name.endsWith(".*") => {
+    case _ if name.endsWith(".*") =>
       val parts = UnresolvedAttribute.parseAttributeName(name.substring(0, name.length - 2))
       UnresolvedStar(Some(parts))
-    }
     case _ => UnresolvedAttribute.quotedString(name)
   })
+
+  override def toString: String = usePrettyExpression(expr).sql
+
+  override def equals(that: Any): Boolean = that match {
+    case that: Column => that.expr.equals(this.expr)
+    case _ => false
+  }
+
+  override def hashCode: Int = this.expr.hashCode()
 
   /** Creates a column based on the given expression. */
   private def withExpr(newExpr: Expression): Column = new Column(newExpr)
@@ -124,27 +160,34 @@ class Column(protected[sql] val expr: Expression) extends Logging {
     // make it a NamedExpression.
     case u: UnresolvedAttribute => UnresolvedAlias(u)
 
+    case u: UnresolvedExtractValue => UnresolvedAlias(u)
+
     case expr: NamedExpression => expr
 
     // Leave an unaliased generator with an empty list of names since the analyzer will generate
     // the correct defaults after the nested expression's type has been resolved.
-    case explode: Explode => MultiAlias(explode, Nil)
+    case g: Generator => MultiAlias(g, Nil)
 
-    case jt: JsonTuple => MultiAlias(jt, Nil)
+    case func: UnresolvedFunction => UnresolvedAlias(func, Some(Column.generateAlias))
 
-    case func: UnresolvedFunction => UnresolvedAlias(func, Some(func.prettyString))
+    // If we have a top level Cast, there is a chance to give it a better alias, if there is a
+    // NamedExpression under this Cast.
+    case c: Cast =>
+      c.transformUp {
+        case c @ Cast(_: NamedExpression, _, _) => UnresolvedAlias(c)
+      } match {
+        case ne: NamedExpression => ne
+        case other => Alias(expr, usePrettyExpression(expr).sql)()
+      }
 
-    case expr: Expression => Alias(expr, expr.prettyString)()
+    case a: AggregateExpression if a.aggregateFunction.isInstanceOf[TypedAggregateExpression] =>
+      UnresolvedAlias(a, Some(Column.generateAlias))
+
+    // Wait until the struct is resolved. This will generate a nicer looking alias.
+    case struct: CreateNamedStructLike => UnresolvedAlias(struct)
+
+    case expr: Expression => Alias(expr, usePrettyExpression(expr).sql)()
   }
-
-  override def toString: String = expr.prettyString
-
-  override def equals(that: Any): Boolean = that match {
-    case that: Column => that.expr.equals(this.expr)
-    case _ => false
-  }
-
-  override def hashCode: Int = this.expr.hashCode
 
   /**
    * Provides a type hint about the expected return value of this column.  This information can
@@ -247,6 +290,23 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * Inequality test.
    * {{{
    *   // Scala:
+   *   df.select( df("colA") =!= df("colB") )
+   *   df.select( !(df("colA") === df("colB")) )
+   *
+   *   // Java:
+   *   import static org.apache.spark.sql.functions.*;
+   *   df.filter( col("colA").notEqual(col("colB")) );
+   * }}}
+   *
+   * @group expr_ops
+   * @since 2.0.0
+    */
+  def =!= (other: Any): Column = withExpr{ Not(EqualTo(expr, lit(other).expr)) }
+
+  /**
+   * Inequality test.
+   * {{{
+   *   // Scala:
    *   df.select( df("colA") !== df("colB") )
    *   df.select( !(df("colA") === df("colB")) )
    *
@@ -257,8 +317,9 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    *
    * @group expr_ops
    * @since 1.3.0
-   */
-  def !== (other: Any): Column = withExpr{ Not(EqualTo(expr, lit(other).expr)) }
+    */
+  @deprecated("!== does not have the same precedence as ===, use =!= instead", "2.0.0")
+  def !== (other: Any): Column = this =!= other
 
   /**
    * Inequality test.
@@ -437,8 +498,11 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @since 1.4.0
    */
   def when(condition: Column, value: Any): Column = this.expr match {
-    case CaseWhen(branches: Seq[Expression]) =>
-      withExpr { CaseWhen(branches ++ Seq(lit(condition).expr, lit(value).expr)) }
+    case CaseWhen(branches, None) =>
+      withExpr { CaseWhen(branches :+ (condition.expr, lit(value).expr)) }
+    case CaseWhen(branches, Some(_)) =>
+      throw new IllegalArgumentException(
+        "when() cannot be applied once otherwise() is applied")
     case _ =>
       throw new IllegalArgumentException(
         "when() can only be applied on a Column previously generated by when() function")
@@ -466,13 +530,11 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @since 1.4.0
    */
   def otherwise(value: Any): Column = this.expr match {
-    case CaseWhen(branches: Seq[Expression]) =>
-      if (branches.size % 2 == 0) {
-        withExpr { CaseWhen(branches :+ lit(value).expr) }
-      } else {
-        throw new IllegalArgumentException(
-          "otherwise() can only be applied once on a Column previously generated by when()")
-      }
+    case CaseWhen(branches, None) =>
+      withExpr { CaseWhen(branches, Option(lit(value).expr)) }
+    case CaseWhen(branches, Some(_)) =>
+      throw new IllegalArgumentException(
+        "otherwise() can only be applied once on a Column previously generated by when()")
     case _ =>
       throw new IllegalArgumentException(
         "otherwise() can only be applied on a Column previously generated by when()")
@@ -713,18 +775,6 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * by the evaluated values of the arguments.
    *
    * @group expr_ops
-   * @since 1.3.0
-   * @deprecated As of 1.5.0. Use isin. This will be removed in Spark 2.0.
-   */
-  @deprecated("use isin. This will be removed in Spark 2.0.", "1.5.0")
-  @scala.annotation.varargs
-  def in(list: Any*): Column = isin(list : _*)
-
-  /**
-   * A boolean expression that is evaluated to true if the value of this expression is contained
-   * by the evaluated values of the arguments.
-   *
-   * @group expr_ops
    * @since 1.5.0
    */
   @scala.annotation.varargs
@@ -748,7 +798,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
 
   /**
    * An expression that gets an item at position `ordinal` out of an array,
-   * or gets a value by key `key` in a [[MapType]].
+   * or gets a value by key `key` in a `MapType`.
    *
    * @group expr_ops
    * @since 1.3.0
@@ -756,7 +806,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
   def getItem(key: Any): Column = withExpr { UnresolvedExtractValue(expr, Literal(key)) }
 
   /**
-   * An expression that gets a field by name in a [[StructType]].
+   * An expression that gets a field by name in a `StructType`.
    *
    * @group expr_ops
    * @since 1.3.0
@@ -839,7 +889,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @group expr_ops
    * @since 1.4.0
    */
-  def alias(alias: String): Column = as(alias)
+  def alias(alias: String): Column = name(alias)
 
   /**
    * Gives the column an alias.
@@ -854,12 +904,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @group expr_ops
    * @since 1.3.0
    */
-  def as(alias: String): Column = withExpr {
-    expr match {
-      case ne: NamedExpression => Alias(expr, alias)(explicitMetadata = Some(ne.metadata))
-      case other => Alias(other, alias)()
-    }
-  }
+  def as(alias: String): Column = name(alias)
 
   /**
    * (Scala-specific) Assigns the given aliases to the results of a table generating function.
@@ -898,12 +943,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @group expr_ops
    * @since 1.3.0
    */
-  def as(alias: Symbol): Column = withExpr {
-    expr match {
-      case ne: NamedExpression => Alias(expr, alias.name)(explicitMetadata = Some(ne.metadata))
-      case other => Alias(other, alias.name)()
-    }
-  }
+  def as(alias: Symbol): Column = name(alias.name)
 
   /**
    * Gives the column an alias with metadata.
@@ -920,6 +960,26 @@ class Column(protected[sql] val expr: Expression) extends Logging {
   }
 
   /**
+   * Gives the column a name (alias).
+   * {{{
+   *   // Renames colA to colB in select output.
+   *   df.select($"colA".name("colB"))
+   * }}}
+   *
+   * If the current column has metadata associated with it, this metadata will be propagated
+   * to the new column.  If this not desired, use `as` with explicitly empty metadata.
+   *
+   * @group expr_ops
+   * @since 2.0.0
+   */
+  def name(alias: String): Column = withExpr {
+    expr match {
+      case ne: NamedExpression => Alias(expr, alias)(explicitMetadata = Some(ne.metadata))
+      case other => Alias(other, alias)()
+    }
+  }
+
+  /**
    * Casts the column to a different data type.
    * {{{
    *   // Casts colA to IntegerType.
@@ -933,13 +993,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @group expr_ops
    * @since 1.3.0
    */
-  def cast(to: DataType): Column = withExpr {
-    expr match {
-      // keeps the name of expression if possible when do cast.
-      case ne: NamedExpression => UnresolvedAlias(Cast(expr, to))
-      case _ => Cast(expr, to)
-    }
-  }
+  def cast(to: DataType): Column = withExpr { Cast(expr, to) }
 
   /**
    * Casts the column to a different data type, using the canonical string representation
@@ -953,12 +1007,12 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    * @group expr_ops
    * @since 1.3.0
    */
-  def cast(to: String): Column = cast(DataTypeParser.parse(to))
+  def cast(to: String): Column = cast(CatalystSqlParser.parseDataType(to))
 
   /**
    * Returns an ordering used in sorting.
    * {{{
-   *   // Scala: sort a DataFrame by age column in descending order.
+   *   // Scala
    *   df.sort(df("age").desc)
    *
    *   // Java
@@ -971,7 +1025,37 @@ class Column(protected[sql] val expr: Expression) extends Logging {
   def desc: Column = withExpr { SortOrder(expr, Descending) }
 
   /**
-   * Returns an ordering used in sorting.
+   * Returns a descending ordering used in sorting, where null values appear before non-null values.
+   * {{{
+   *   // Scala: sort a DataFrame by age column in descending order and null values appearing first.
+   *   df.sort(df("age").desc_nulls_first)
+   *
+   *   // Java
+   *   df.sort(df.col("age").desc_nulls_first());
+   * }}}
+   *
+   * @group expr_ops
+   * @since 2.1.0
+   */
+  def desc_nulls_first: Column = withExpr { SortOrder(expr, Descending, NullsFirst, Set.empty) }
+
+  /**
+   * Returns a descending ordering used in sorting, where null values appear after non-null values.
+   * {{{
+   *   // Scala: sort a DataFrame by age column in descending order and null values appearing last.
+   *   df.sort(df("age").desc_nulls_last)
+   *
+   *   // Java
+   *   df.sort(df.col("age").desc_nulls_last());
+   * }}}
+   *
+   * @group expr_ops
+   * @since 2.1.0
+   */
+  def desc_nulls_last: Column = withExpr { SortOrder(expr, Descending, NullsLast, Set.empty) }
+
+  /**
+   * Returns an ascending ordering used in sorting.
    * {{{
    *   // Scala: sort a DataFrame by age column in ascending order.
    *   df.sort(df("age").asc)
@@ -986,6 +1070,36 @@ class Column(protected[sql] val expr: Expression) extends Logging {
   def asc: Column = withExpr { SortOrder(expr, Ascending) }
 
   /**
+   * Returns an ascending ordering used in sorting, where null values appear before non-null values.
+   * {{{
+   *   // Scala: sort a DataFrame by age column in ascending order and null values appearing first.
+   *   df.sort(df("age").asc_nulls_last)
+   *
+   *   // Java
+   *   df.sort(df.col("age").asc_nulls_last());
+   * }}}
+   *
+   * @group expr_ops
+   * @since 2.1.0
+   */
+  def asc_nulls_first: Column = withExpr { SortOrder(expr, Ascending, NullsFirst, Set.empty) }
+
+  /**
+   * Returns an ordering used in sorting, where null values appear after non-null values.
+   * {{{
+   *   // Scala: sort a DataFrame by age column in ascending order and null values appearing last.
+   *   df.sort(df("age").asc_nulls_last)
+   *
+   *   // Java
+   *   df.sort(df.col("age").asc_nulls_last());
+   * }}}
+   *
+   * @group expr_ops
+   * @since 2.1.0
+   */
+  def asc_nulls_last: Column = withExpr { SortOrder(expr, Ascending, NullsLast, Set.empty) }
+
+  /**
    * Prints the expression to the console for debugging purpose.
    *
    * @group df_ops
@@ -996,7 +1110,7 @@ class Column(protected[sql] val expr: Expression) extends Logging {
     if (extended) {
       println(expr)
     } else {
-      println(expr.prettyString)
+      println(expr.sql)
     }
     // scalastyle:on println
   }
@@ -1050,105 +1164,120 @@ class Column(protected[sql] val expr: Expression) extends Logging {
    */
   def over(window: expressions.WindowSpec): Column = window.withAggregate(this)
 
+  /**
+   * Define a empty analytic clause. In this case the analytic function is applied
+   * and presented for all rows in the result set.
+   *
+   * {{{
+   *   df.select(
+   *     sum("price").over(),
+   *     avg("price").over()
+   *   )
+   * }}}
+   *
+   * @group expr_ops
+   * @since 2.0.0
+   */
+  def over(): Column = over(Window.spec)
+
 }
 
 
 /**
- * :: Experimental ::
  * A convenient class used for constructing schema.
  *
  * @since 1.3.0
  */
-@Experimental
+@InterfaceStability.Stable
 class ColumnName(name: String) extends Column(name) {
 
   /**
-   * Creates a new [[StructField]] of type boolean.
+   * Creates a new `StructField` of type boolean.
    * @since 1.3.0
    */
   def boolean: StructField = StructField(name, BooleanType)
 
   /**
-   * Creates a new [[StructField]] of type byte.
+   * Creates a new `StructField` of type byte.
    * @since 1.3.0
    */
   def byte: StructField = StructField(name, ByteType)
 
   /**
-   * Creates a new [[StructField]] of type short.
+   * Creates a new `StructField` of type short.
    * @since 1.3.0
    */
   def short: StructField = StructField(name, ShortType)
 
   /**
-   * Creates a new [[StructField]] of type int.
+   * Creates a new `StructField` of type int.
    * @since 1.3.0
    */
   def int: StructField = StructField(name, IntegerType)
 
   /**
-   * Creates a new [[StructField]] of type long.
+   * Creates a new `StructField` of type long.
    * @since 1.3.0
    */
   def long: StructField = StructField(name, LongType)
 
   /**
-   * Creates a new [[StructField]] of type float.
+   * Creates a new `StructField` of type float.
    * @since 1.3.0
    */
   def float: StructField = StructField(name, FloatType)
 
   /**
-   * Creates a new [[StructField]] of type double.
+   * Creates a new `StructField` of type double.
    * @since 1.3.0
    */
   def double: StructField = StructField(name, DoubleType)
 
   /**
-   * Creates a new [[StructField]] of type string.
+   * Creates a new `StructField` of type string.
    * @since 1.3.0
    */
   def string: StructField = StructField(name, StringType)
 
   /**
-   * Creates a new [[StructField]] of type date.
+   * Creates a new `StructField` of type date.
    * @since 1.3.0
    */
   def date: StructField = StructField(name, DateType)
 
   /**
-   * Creates a new [[StructField]] of type decimal.
+   * Creates a new `StructField` of type decimal.
    * @since 1.3.0
    */
   def decimal: StructField = StructField(name, DecimalType.USER_DEFAULT)
 
   /**
-   * Creates a new [[StructField]] of type decimal.
+   * Creates a new `StructField` of type decimal.
    * @since 1.3.0
    */
   def decimal(precision: Int, scale: Int): StructField =
     StructField(name, DecimalType(precision, scale))
 
   /**
-   * Creates a new [[StructField]] of type timestamp.
+   * Creates a new `StructField` of type timestamp.
    * @since 1.3.0
    */
   def timestamp: StructField = StructField(name, TimestampType)
 
   /**
-   * Creates a new [[StructField]] of type binary.
+   * Creates a new `StructField` of type binary.
    * @since 1.3.0
    */
   def binary: StructField = StructField(name, BinaryType)
 
   /**
-   * Creates a new [[StructField]] of type array.
+   * Creates a new `StructField` of type array.
    * @since 1.3.0
    */
   def array(dataType: DataType): StructField = StructField(name, ArrayType(dataType))
 
   /**
-   * Creates a new [[StructField]] of type map.
+   * Creates a new `StructField` of type map.
    * @since 1.3.0
    */
   def map(keyType: DataType, valueType: DataType): StructField =
@@ -1157,13 +1286,13 @@ class ColumnName(name: String) extends Column(name) {
   def map(mapType: MapType): StructField = StructField(name, mapType)
 
   /**
-   * Creates a new [[StructField]] of type struct.
+   * Creates a new `StructField` of type struct.
    * @since 1.3.0
    */
   def struct(fields: StructField*): StructField = struct(StructType(fields))
 
   /**
-   * Creates a new [[StructField]] of type struct.
+   * Creates a new `StructField` of type struct.
    * @since 1.3.0
    */
   def struct(structType: StructType): StructField = StructField(name, structType)

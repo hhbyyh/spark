@@ -19,7 +19,7 @@ package org.apache.spark.mllib.linalg
 
 import breeze.linalg.{DenseMatrix => BDM, DenseVector => BDV}
 import com.github.fommil.netlib.ARPACK
-import org.netlib.util.{intW, doubleW}
+import org.netlib.util.{doubleW, intW}
 
 /**
  * Compute eigen-decomposition.
@@ -32,7 +32,7 @@ private[mllib] object EigenValueDecomposition {
    *
    * @param mul a function that multiplies the symmetric matrix with a DenseVector.
    * @param n dimension of the square matrix (maximum Int.MaxValue).
-   * @param k number of leading eigenvalues required, 0 < k < n.
+   * @param k number of leading eigenvalues required, where k must be positive and less than n.
    * @param tol tolerance of the eigs computation.
    * @param maxIterations the maximum number of Arnoldi update iterations.
    * @return a dense vector of eigenvalues in descending order and a dense matrix of eigenvectors

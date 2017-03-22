@@ -20,8 +20,6 @@ Random Forest Regression Example.
 """
 from __future__ import print_function
 
-import sys
-
 from pyspark import SparkContext
 # $example on$
 from pyspark.mllib.tree import RandomForest, RandomForestModel
@@ -47,7 +45,7 @@ if __name__ == "__main__":
     # Evaluate model on test instances and compute test error
     predictions = model.predict(testData.map(lambda x: x.features))
     labelsAndPredictions = testData.map(lambda lp: lp.label).zip(predictions)
-    testMSE = labelsAndPredictions.map(lambda (v, p): (v - p) * (v - p)).sum() /\
+    testMSE = labelsAndPredictions.map(lambda lp: (lp[0] - lp[1]) * (lp[0] - lp[1])).sum() /\
         float(testData.count())
     print('Test Mean Squared Error = ' + str(testMSE))
     print('Learned regression forest model:')
